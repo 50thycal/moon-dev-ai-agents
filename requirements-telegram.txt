@@ -1,0 +1,23 @@
+# Minimal requirements for Telegram Trading Bot
+# Use this for Railway deployment
+
+# Core
+python-dotenv>=1.0.0
+requests>=2.31.0
+termcolor>=2.3.0
+pandas>=2.0.0
+
+# AI Models
+anthropic>=0.40.0
+openai>=1.0.0
+
+# Web/Async
+aiohttp>=3.9.0
+httpx>=0.25.0
+
+# Crypto/Trading (for Aster/HyperLiquid)
+eth-account>=0.10.0
+web3>=6.0.0
+
+# Data
+numpy>=1.24.0

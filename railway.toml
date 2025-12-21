@@ -1,0 +1,10 @@
+[build]
+builder = "nixpacks"
+
+[build.nixpacks]
+installCmd = "pip install -r requirements-telegram.txt"
+
+[deploy]
+startCommand = "python src/agents/telegram_trading_agent.py"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
