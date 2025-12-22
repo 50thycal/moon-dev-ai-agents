@@ -21,9 +21,11 @@ aiofiles>=23.0.0
 eth-account>=0.10.0
 web3>=6.0.0
 base58>=2.1.0
+hyperliquid-python-sdk>=0.5.0
 
 # Data Analysis
 ta>=0.10.0
+pandas_ta>=0.3.14b
 
 # Utilities
 python-dateutil>=2.8.0
