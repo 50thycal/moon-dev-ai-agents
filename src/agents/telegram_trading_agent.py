@@ -399,16 +399,22 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
         return {"success": False, "error": str(e)}
 
 
-def buy_token(token_symbol: str, usdc_amount: float) -> dict:
-    """Buy a token with USDC"""
+def buy_token(token_symbol: str, token_amount: float) -> dict:
+    """Buy a specific amount of a token using USDC"""
     token_mint = TOKENS.get(token_symbol.upper())
     if not token_mint:
         return {"success": False, "error": f"Unknown token: {token_symbol}"}
 
-    # Convert USDC amount to units (6 decimals)
-    amount_units = int(usdc_amount * 1_000_000)
+    # Get current price to calculate USDC needed
+    price = get_token_price(token_symbol)
+    if price <= 0:
+        return {"success": False, "error": "Could not get token price"}
 
-    return execute_swap(USDC_ADDRESS, token_mint, amount_units)
+    # Calculate USDC needed (add 5% buffer for slippage)
+    usdc_needed = token_amount * price * 1.05
+    usdc_units = int(usdc_needed * 1_000_000)  # USDC has 6 decimals
+
+    return execute_swap(USDC_ADDRESS, token_mint, usdc_units)
 
 
 def sell_token(token_symbol: str, token_amount: float) -> dict:
@@ -600,9 +606,9 @@ Send /help for commands""")
 /help - Show this message
 
 <b>Examples:</b>
-• /buy 1 sol - Buy $1 worth of SOL
+• /buy 0.01 sol - Buy 0.01 SOL
 • /sell 0.01 sol - Sell 0.01 SOL
-• /buy 0.5 bonk - Buy $0.50 of BONK
+• /buy 1000 bonk - Buy 1000 BONK
 
 <b>Available:</b> SOL, BONK, WIF""")
 
@@ -660,9 +666,14 @@ Current: {self.active_token}""")
                         token = p.upper()
 
             if amount and token:
+                # Get price to show estimated cost
+                price = get_token_price(token)
+                est_cost = amount * price if price > 0 else 0
+
                 send_telegram(f"""<b>Executing BUY...</b>
 
-Buying ${amount:.2f} worth of {token}
+Buying {amount} {token}
+Est. cost: ~${est_cost:.2f} USDC
 Please wait...""")
 
                 # Execute the trade (buy with USDC)
@@ -671,7 +682,7 @@ Please wait...""")
                 if result.get("success"):
                     send_telegram(f"""<b>BUY SUCCESS!</b>
 
-<b>Bought:</b> ${amount:.2f} of {token}
+<b>Bought:</b> {amount} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
 Your balance has been updated.""")
@@ -687,11 +698,11 @@ Try again or use /trade for manual swap.""")
 Usage: /buy [amount] [token]
 
 <b>Examples:</b>
-• /buy 0.5 sol - Buy $0.50 of SOL
-• /buy 1 bonk - Buy $1 of BONK
-• /buy 2 wif - Buy $2 of WIF
+• /buy 0.01 sol - Buy 0.01 SOL
+• /buy 1000 bonk - Buy 1000 BONK
+• /buy 0.5 wif - Buy 0.5 WIF
 
-Amount is in USDC (dollars).""")
+Amount is in token units.""")
 
         elif cmd.startswith("/sell") or cmd.startswith("sell "):
             # Parse various formats:
