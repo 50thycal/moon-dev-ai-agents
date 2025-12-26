@@ -13,9 +13,9 @@ openai>=1.0.0
 # Web/Async
 httpx>=0.25.0
 
-# Solana/Crypto
+# Solana/Crypto - need both packages
 solders>=0.18.0
-solana>=0.30.0
+solana-py>=0.30.0
 
 # Data
 numpy>=1.24.0

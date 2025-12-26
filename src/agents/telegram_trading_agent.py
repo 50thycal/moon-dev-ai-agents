@@ -40,9 +40,10 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 USDC_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_ADDRESS = "So11111111111111111111111111111111111111111"
 
-# Trading Settings
+# Trading Settings - All tradeable tokens
 TOKENS = {
     "SOL": SOL_ADDRESS,
+    "USDC": USDC_ADDRESS,
     "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
     "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
 }
@@ -124,6 +125,7 @@ def check_telegram_commands() -> str:
 # CoinGecko IDs for tokens
 COINGECKO_IDS = {
     "SOL": "solana",
+    "USDC": "usd-coin",
     "BONK": "bonk",
     "WIF": "dogwifcoin",
 }
@@ -406,10 +408,33 @@ def sell_token(token_symbol: str, token_amount: float) -> dict:
         amount_units = int(token_amount * 100_000)  # 5 decimals
     elif token_symbol.upper() == "WIF":
         amount_units = int(token_amount * 1_000_000)  # 6 decimals
+    elif token_symbol.upper() == "USDC":
+        amount_units = int(token_amount * 1_000_000)  # 6 decimals
     else:
         amount_units = int(token_amount * 1_000_000)  # Default 6 decimals
 
     return execute_swap(token_mint, USDC_ADDRESS, amount_units)
+
+
+def swap_tokens(from_token: str, to_token: str, amount: float) -> dict:
+    """Generic swap between any two tokens"""
+    from_mint = TOKENS.get(from_token.upper())
+    to_mint = TOKENS.get(to_token.upper())
+
+    if not from_mint:
+        return {"success": False, "error": f"Unknown token: {from_token}"}
+    if not to_mint:
+        return {"success": False, "error": f"Unknown token: {to_token}"}
+
+    # Get decimals for from_token
+    if from_token.upper() == "SOL":
+        amount_units = int(amount * 1_000_000_000)  # 9 decimals
+    elif from_token.upper() == "BONK":
+        amount_units = int(amount * 100_000)  # 5 decimals
+    else:
+        amount_units = int(amount * 1_000_000)  # 6 decimals (USDC, WIF, etc.)
+
+    return execute_swap(from_mint, to_mint, amount_units)
 
 # ============================================================================
 # AI ANALYSIS
@@ -597,98 +622,103 @@ USDC: ${wallet.get('usdc', 0):.2f}
             send_telegram(f"""<b>Available Tokens:</b>
 
 {token_list}
-- USDC
 
 Current: {self.active_token}""")
 
         elif cmd.startswith("/buy") or cmd.startswith("buy "):
-            # Parse: /buy 1 sol or "buy 0.5 bonk"
-            parts = cmd.replace("/buy", "").replace("buy", "").strip().split()
+            # Parse various formats:
+            # /buy 0.5 sol, /buy sol with 0.5 usdc, /buy 0.5 usdc worth of sol
+            text = cmd.replace("/buy", "").replace("buy", "").strip()
+            text = text.replace(" with ", " ").replace(" worth of ", " ").replace(" of ", " ").replace(" for ", " ")
+            parts = [p for p in text.split() if p]
 
-            if len(parts) >= 2:
+            # Try to find amount and token
+            amount = None
+            token = None
+
+            for p in parts:
                 try:
-                    amount = float(parts[0])
-                    token = parts[1].upper()
+                    amount = float(p)
+                except ValueError:
+                    if p.upper() in TOKENS and p.upper() != "USDC":
+                        token = p.upper()
 
-                    if token not in TOKENS:
-                        send_telegram(f"Unknown token: {token}\n\nAvailable: SOL, BONK, WIF")
-                        return
-
-                    # Confirm the trade
-                    sol_price = get_sol_price()
-                    send_telegram(f"""<b>Executing BUY...</b>
+            if amount and token:
+                send_telegram(f"""<b>Executing BUY...</b>
 
 Buying ${amount:.2f} worth of {token}
 Please wait...""")
 
-                    # Execute the trade
-                    result = buy_token(token, amount)
+                # Execute the trade (buy with USDC)
+                result = buy_token(token, amount)
 
-                    if result.get("success"):
-                        send_telegram(f"""<b>BUY SUCCESS!</b>
+                if result.get("success"):
+                    send_telegram(f"""<b>BUY SUCCESS!</b>
 
 <b>Bought:</b> ${amount:.2f} of {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
 Your balance has been updated.""")
-                    else:
-                        send_telegram(f"""<b>BUY FAILED</b>
+                else:
+                    send_telegram(f"""<b>BUY FAILED</b>
 
 <b>Error:</b> {result.get('error')}
 
 Try again or use /trade for manual swap.""")
-
-                except ValueError:
-                    send_telegram("Invalid amount. Use: /buy 1 sol")
             else:
                 send_telegram("""<b>Buy Command</b>
 
 Usage: /buy [amount] [token]
 
 <b>Examples:</b>
-• /buy 1 sol - Buy $1 of SOL
-• /buy 0.5 bonk - Buy $0.50 of BONK
+• /buy 0.5 sol - Buy $0.50 of SOL
+• /buy 1 bonk - Buy $1 of BONK
 • /buy 2 wif - Buy $2 of WIF
 
-Amount is in USDC.""")
+Amount is in USDC (dollars).""")
 
         elif cmd.startswith("/sell") or cmd.startswith("sell "):
-            # Parse: /sell 0.01 sol or "sell 1000 bonk"
-            parts = cmd.replace("/sell", "").replace("sell", "").strip().split()
+            # Parse various formats:
+            # /sell 0.01 sol, /sell 0.01 sol for usdc
+            text = cmd.replace("/sell", "").replace("sell", "").strip()
+            text = text.replace(" for ", " ").replace(" to ", " ")
+            parts = [p for p in text.split() if p]
 
-            if len(parts) >= 2:
+            # Try to find amount and token
+            amount = None
+            token = None
+
+            for i, p in enumerate(parts):
                 try:
-                    amount = float(parts[0])
-                    token = parts[1].upper()
+                    amount = float(p)
+                    # Token should be next
+                    if i + 1 < len(parts) and parts[i + 1].upper() in TOKENS:
+                        token = parts[i + 1].upper()
+                except ValueError:
+                    pass
 
-                    if token not in TOKENS:
-                        send_telegram(f"Unknown token: {token}\n\nAvailable: SOL, BONK, WIF")
-                        return
-
-                    send_telegram(f"""<b>Executing SELL...</b>
+            if amount and token:
+                send_telegram(f"""<b>Executing SELL...</b>
 
 Selling {amount} {token} for USDC
 Please wait...""")
 
-                    # Execute the trade
-                    result = sell_token(token, amount)
+                # Execute the trade
+                result = sell_token(token, amount)
 
-                    if result.get("success"):
-                        send_telegram(f"""<b>SELL SUCCESS!</b>
+                if result.get("success"):
+                    send_telegram(f"""<b>SELL SUCCESS!</b>
 
 <b>Sold:</b> {amount} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
 Your balance has been updated.""")
-                    else:
-                        send_telegram(f"""<b>SELL FAILED</b>
+                else:
+                    send_telegram(f"""<b>SELL FAILED</b>
 
 <b>Error:</b> {result.get('error')}
 
 Try again or use /trade for manual swap.""")
-
-                except ValueError:
-                    send_telegram("Invalid amount. Use: /sell 0.01 sol")
             else:
                 send_telegram("""<b>Sell Command</b>
 
