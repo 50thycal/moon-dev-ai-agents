@@ -121,28 +121,85 @@ def check_telegram_commands() -> str:
 # SOLANA/JUPITER FUNCTIONS
 # ============================================================================
 
+# CoinGecko IDs for tokens
+COINGECKO_IDS = {
+    "SOL": "solana",
+    "BONK": "bonk",
+    "WIF": "dogwifcoin",
+}
+
 def get_sol_price() -> float:
-    """Get SOL price from Jupiter"""
+    """Get SOL price from CoinGecko (more reliable than Jupiter API)"""
     try:
-        url = "https://price.jup.ag/v6/price?ids=SOL"
+        # Try CoinGecko first (free, no API key needed)
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
         response = requests.get(url, timeout=10)
-        data = response.json()
-        return float(data.get("data", {}).get("SOL", {}).get("price", 0))
+        if response.status_code == 200:
+            data = response.json()
+            price = data.get("solana", {}).get("usd", 0)
+            if price > 0:
+                return float(price)
     except Exception as e:
-        print(f"Price error: {e}")
-        return 0
+        print(f"CoinGecko error: {e}")
+
+    # Fallback to Birdeye if available
+    if BIRDEYE_API_KEY:
+        try:
+            url = f"https://public-api.birdeye.so/defi/price?address={SOL_ADDRESS}"
+            headers = {"X-API-KEY": BIRDEYE_API_KEY}
+            response = requests.get(url, headers=headers, timeout=10)
+            data = response.json()
+            if data.get("success"):
+                return float(data.get("data", {}).get("value", 0))
+        except Exception as e:
+            print(f"Birdeye price error: {e}")
+
+    return 0
 
 def get_token_price(symbol: str) -> float:
-    """Get token price from Jupiter"""
+    """Get token price from CoinGecko or Birdeye"""
     try:
-        mint = TOKENS.get(symbol, symbol)
-        url = f"https://price.jup.ag/v6/price?ids={mint}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        return float(data.get("data", {}).get(mint, {}).get("price", 0))
+        # Try CoinGecko first
+        cg_id = COINGECKO_IDS.get(symbol)
+        if cg_id:
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                price = data.get(cg_id, {}).get("usd", 0)
+                if price > 0:
+                    return float(price)
     except Exception as e:
-        print(f"Price error for {symbol}: {e}")
-        return 0
+        print(f"CoinGecko error for {symbol}: {e}")
+
+    # Fallback to Birdeye
+    if BIRDEYE_API_KEY:
+        try:
+            mint = TOKENS.get(symbol, symbol)
+            url = f"https://public-api.birdeye.so/defi/price?address={mint}"
+            headers = {"X-API-KEY": BIRDEYE_API_KEY}
+            response = requests.get(url, headers=headers, timeout=10)
+            data = response.json()
+            if data.get("success"):
+                return float(data.get("data", {}).get("value", 0))
+        except Exception as e:
+            print(f"Birdeye price error for {symbol}: {e}")
+
+    return 0
+
+def get_jupiter_swap_url(input_token: str, output_token: str, amount: float = None) -> str:
+    """Generate Jupiter swap URL for easy trading"""
+    input_mint = TOKENS.get(input_token.upper(), USDC_ADDRESS)
+    output_mint = TOKENS.get(output_token.upper(), SOL_ADDRESS)
+
+    # Handle common aliases
+    if input_token.upper() == "USDC":
+        input_mint = USDC_ADDRESS
+    if output_token.upper() == "USDC":
+        output_mint = USDC_ADDRESS
+
+    base_url = f"https://jup.ag/swap/{input_mint}-{output_mint}"
+    return base_url
 
 def get_birdeye_candles(token_address: str, interval: str = "1H", limit: int = 50) -> list:
     """Get OHLCV candles from Birdeye API"""
@@ -426,15 +483,20 @@ Send /help for commands""")
 
 /status - Check wallet balance
 /price - Get current SOL price
+/trade - Get Jupiter swap link
 /tokens - List available tokens
 /pause - Pause trading signals
 /resume - Resume trading signals
 /help - Show this message
 
-<b>Available Tokens:</b> SOL, BONK, WIF
+<b>Trade Examples:</b>
+• /trade usdc sol - Swap USDC to SOL
+• /trade sol usdc - Swap SOL to USDC
+• /trade usdc bonk - Buy BONK with USDC
 
-Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes
-<i>Note: This is a SIGNAL bot - trades require manual execution on Jupiter</i>""")
+<b>Available Tokens:</b> SOL, BONK, WIF, USDC
+
+Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes""")
 
         elif cmd == "/status":
             wallet = get_wallet_balance()
@@ -468,8 +530,57 @@ USDC: ${wallet.get('usdc', 0):.2f}
             send_telegram(f"""<b>Available Tokens:</b>
 
 {token_list}
+- USDC
 
 Current: {self.active_token}""")
+
+        elif cmd.startswith("/trade") or cmd.startswith("trade"):
+            # Parse trade command: /trade usdc sol or "trade usdc to sol"
+            parts = cmd.replace("/trade", "").replace("trade", "").strip()
+            parts = parts.replace(" to ", " ").replace(" for ", " ").split()
+
+            if len(parts) >= 2:
+                input_token = parts[0].upper()
+                output_token = parts[1].upper()
+
+                # Get prices
+                sol_price = get_sol_price()
+
+                # Generate Jupiter URL
+                swap_url = get_jupiter_swap_url(input_token, output_token)
+
+                send_telegram(f"""<b>Trade: {input_token} → {output_token}</b>
+
+<b>Current SOL Price:</b> ${sol_price:,.2f}
+
+<b>Click to trade on Jupiter:</b>
+{swap_url}
+
+<i>This opens Jupiter DEX where you can:
+1. Connect your Phantom wallet
+2. Enter amount
+3. Confirm swap</i>""")
+            else:
+                send_telegram("""<b>Trade Command</b>
+
+Usage: /trade [from] [to]
+
+<b>Examples:</b>
+• /trade usdc sol - Buy SOL with USDC
+• /trade sol usdc - Sell SOL for USDC
+• /trade usdc bonk - Buy BONK
+
+<b>Quick Links:</b>
+• <a href="https://jup.ag/swap/USDC-SOL">Buy SOL</a>
+• <a href="https://jup.ag/swap/SOL-USDC">Sell SOL</a>""")
+
+        else:
+            # Unknown command - provide help
+            if cmd and not cmd.startswith("/"):
+                send_telegram(f"""I don't understand "{cmd}"
+
+Try /help for available commands
+Or /trade usdc sol to get a swap link""")
 
     def run_cycle(self):
         """Run one trading cycle"""
