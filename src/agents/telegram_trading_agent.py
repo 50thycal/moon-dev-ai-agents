@@ -660,9 +660,17 @@ Current: {self.active_token}""")
                         token = p.upper()
 
             if amount and token:
+                # Format amount nicely (show more decimals for small amounts)
+                if amount < 0.01:
+                    amount_str = f"${amount:.4f}"
+                elif amount < 1:
+                    amount_str = f"${amount:.3f}"
+                else:
+                    amount_str = f"${amount:.2f}"
+
                 send_telegram(f"""<b>Executing BUY...</b>
 
-Buying ${amount:.2f} worth of {token}
+Buying {amount_str} worth of {token}
 Please wait...""")
 
                 # Execute the trade (buy with USDC)
@@ -671,7 +679,7 @@ Please wait...""")
                 if result.get("success"):
                     send_telegram(f"""<b>BUY SUCCESS!</b>
 
-<b>Bought:</b> ${amount:.2f} of {token}
+<b>Bought:</b> {amount_str} of {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
 Your balance has been updated.""")
