@@ -296,58 +296,120 @@ def get_token_balance(wallet_address: str, token_mint: str) -> float:
         print(f"Token balance error: {e}")
         return 0
 
-def execute_swap(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
-    """Execute a swap via Jupiter"""
+def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
+    """Execute a swap via Jupiter - REAL EXECUTION"""
     if not SOLANA_PRIVATE_KEY:
         return {"success": False, "error": "No private key configured"}
 
     try:
+        import base64
         from solders.keypair import Keypair
         from solders.transaction import VersionedTransaction
         from solana.rpc.api import Client
+        from solana.rpc.types import TxOpts
+        from solana.rpc.commitment import Confirmed
 
         keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
         http_client = Client(RPC_ENDPOINT)
 
+        print(f"Executing swap: {input_mint[:8]}... -> {output_mint[:8]}...")
+        print(f"Amount: {amount}")
+
         # Get quote from Jupiter
-        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps={SLIPPAGE_BPS}"
-        quote_response = requests.get(quote_url, timeout=10)
+        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={SLIPPAGE_BPS}"
+        print(f"Getting quote...")
+        quote_response = requests.get(quote_url, timeout=15)
         quote = quote_response.json()
 
         if "error" in quote:
-            return {"success": False, "error": quote.get("error")}
+            return {"success": False, "error": f"Quote error: {quote.get('error')}"}
 
-        # Get swap transaction
+        # Get expected output
+        out_amount = int(quote.get("outAmount", 0))
+        print(f"Expected output: {out_amount}")
+
+        # Get swap transaction from Jupiter
+        print("Getting swap transaction...")
         swap_response = requests.post(
             "https://lite-api.jup.ag/swap/v1/swap",
             headers={"Content-Type": "application/json"},
             json={
                 "quoteResponse": quote,
                 "userPublicKey": str(keypair.pubkey()),
-                "wrapUnwrapSOL": True
+                "wrapUnwrapSOL": True,
+                "dynamicComputeUnitLimit": True,
+                "prioritizationFeeLamports": "auto"
             },
             timeout=30
         )
         swap_data = swap_response.json()
 
         if "error" in swap_data:
-            return {"success": False, "error": swap_data.get("error")}
+            return {"success": False, "error": f"Swap error: {swap_data.get('error')}"}
 
-        # Sign and send transaction
-        import base64
+        if "swapTransaction" not in swap_data:
+            return {"success": False, "error": "No transaction returned from Jupiter"}
+
+        # Decode and sign transaction
+        print("Signing transaction...")
         tx_bytes = base64.b64decode(swap_data["swapTransaction"])
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        signed_tx = keypair.sign_message(bytes(tx.message))
 
-        # This is a simplified version - full implementation would need proper signing
-        return {
-            "success": True,
-            "quote": quote,
-            "message": "Swap prepared (manual execution on Jupiter recommended for safety)"
-        }
+        # Sign the transaction
+        signed_tx = VersionedTransaction(tx.message, [keypair])
+
+        # Send transaction
+        print("Sending transaction...")
+        opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
+        result = http_client.send_transaction(signed_tx, opts=opts)
+
+        # Check result
+        if hasattr(result, 'value'):
+            tx_sig = str(result.value)
+            print(f"Transaction sent: {tx_sig}")
+            return {
+                "success": True,
+                "signature": tx_sig,
+                "out_amount": out_amount,
+                "url": f"https://solscan.io/tx/{tx_sig}"
+            }
+        else:
+            return {"success": False, "error": f"Transaction failed: {result}"}
 
     except Exception as e:
+        print(f"Swap error: {e}")
         return {"success": False, "error": str(e)}
+
+
+def buy_token(token_symbol: str, usdc_amount: float) -> dict:
+    """Buy a token with USDC"""
+    token_mint = TOKENS.get(token_symbol.upper())
+    if not token_mint:
+        return {"success": False, "error": f"Unknown token: {token_symbol}"}
+
+    # Convert USDC amount to units (6 decimals)
+    amount_units = int(usdc_amount * 1_000_000)
+
+    return execute_swap(USDC_ADDRESS, token_mint, amount_units)
+
+
+def sell_token(token_symbol: str, token_amount: float) -> dict:
+    """Sell a token for USDC"""
+    token_mint = TOKENS.get(token_symbol.upper())
+    if not token_mint:
+        return {"success": False, "error": f"Unknown token: {token_symbol}"}
+
+    # Get token decimals (SOL=9, most others=varies)
+    if token_symbol.upper() == "SOL":
+        amount_units = int(token_amount * 1_000_000_000)  # 9 decimals
+    elif token_symbol.upper() == "BONK":
+        amount_units = int(token_amount * 100_000)  # 5 decimals
+    elif token_symbol.upper() == "WIF":
+        amount_units = int(token_amount * 1_000_000)  # 6 decimals
+    else:
+        amount_units = int(token_amount * 1_000_000)  # Default 6 decimals
+
+    return execute_swap(token_mint, USDC_ADDRESS, amount_units)
 
 # ============================================================================
 # AI ANALYSIS
@@ -481,22 +543,27 @@ Send /help for commands""")
         if cmd == "/help" or cmd == "/start":
             send_telegram("""<b>Trading Bot Commands</b>
 
+<b>Trading (REAL):</b>
+/buy [amount] [token] - Buy token with USDC
+/sell [amount] [token] - Sell token for USDC
+
+<b>Info:</b>
 /status - Check wallet balance
 /price - Get current SOL price
-/trade - Get Jupiter swap link
 /tokens - List available tokens
-/pause - Pause trading signals
-/resume - Resume trading signals
+
+<b>Controls:</b>
+/pause - Pause AI signals
+/resume - Resume AI signals
+/trade - Get Jupiter swap link
 /help - Show this message
 
-<b>Trade Examples:</b>
-• /trade usdc sol - Swap USDC to SOL
-• /trade sol usdc - Swap SOL to USDC
-• /trade usdc bonk - Buy BONK with USDC
+<b>Examples:</b>
+• /buy 1 sol - Buy $1 worth of SOL
+• /sell 0.01 sol - Sell 0.01 SOL
+• /buy 0.5 bonk - Buy $0.50 of BONK
 
-<b>Available Tokens:</b> SOL, BONK, WIF, USDC
-
-Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes""")
+<b>Available:</b> SOL, BONK, WIF""")
 
         elif cmd == "/status":
             wallet = get_wallet_balance()
@@ -533,6 +600,106 @@ USDC: ${wallet.get('usdc', 0):.2f}
 - USDC
 
 Current: {self.active_token}""")
+
+        elif cmd.startswith("/buy") or cmd.startswith("buy "):
+            # Parse: /buy 1 sol or "buy 0.5 bonk"
+            parts = cmd.replace("/buy", "").replace("buy", "").strip().split()
+
+            if len(parts) >= 2:
+                try:
+                    amount = float(parts[0])
+                    token = parts[1].upper()
+
+                    if token not in TOKENS:
+                        send_telegram(f"Unknown token: {token}\n\nAvailable: SOL, BONK, WIF")
+                        return
+
+                    # Confirm the trade
+                    sol_price = get_sol_price()
+                    send_telegram(f"""<b>Executing BUY...</b>
+
+Buying ${amount:.2f} worth of {token}
+Please wait...""")
+
+                    # Execute the trade
+                    result = buy_token(token, amount)
+
+                    if result.get("success"):
+                        send_telegram(f"""<b>BUY SUCCESS!</b>
+
+<b>Bought:</b> ${amount:.2f} of {token}
+<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
+
+Your balance has been updated.""")
+                    else:
+                        send_telegram(f"""<b>BUY FAILED</b>
+
+<b>Error:</b> {result.get('error')}
+
+Try again or use /trade for manual swap.""")
+
+                except ValueError:
+                    send_telegram("Invalid amount. Use: /buy 1 sol")
+            else:
+                send_telegram("""<b>Buy Command</b>
+
+Usage: /buy [amount] [token]
+
+<b>Examples:</b>
+• /buy 1 sol - Buy $1 of SOL
+• /buy 0.5 bonk - Buy $0.50 of BONK
+• /buy 2 wif - Buy $2 of WIF
+
+Amount is in USDC.""")
+
+        elif cmd.startswith("/sell") or cmd.startswith("sell "):
+            # Parse: /sell 0.01 sol or "sell 1000 bonk"
+            parts = cmd.replace("/sell", "").replace("sell", "").strip().split()
+
+            if len(parts) >= 2:
+                try:
+                    amount = float(parts[0])
+                    token = parts[1].upper()
+
+                    if token not in TOKENS:
+                        send_telegram(f"Unknown token: {token}\n\nAvailable: SOL, BONK, WIF")
+                        return
+
+                    send_telegram(f"""<b>Executing SELL...</b>
+
+Selling {amount} {token} for USDC
+Please wait...""")
+
+                    # Execute the trade
+                    result = sell_token(token, amount)
+
+                    if result.get("success"):
+                        send_telegram(f"""<b>SELL SUCCESS!</b>
+
+<b>Sold:</b> {amount} {token}
+<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
+
+Your balance has been updated.""")
+                    else:
+                        send_telegram(f"""<b>SELL FAILED</b>
+
+<b>Error:</b> {result.get('error')}
+
+Try again or use /trade for manual swap.""")
+
+                except ValueError:
+                    send_telegram("Invalid amount. Use: /sell 0.01 sol")
+            else:
+                send_telegram("""<b>Sell Command</b>
+
+Usage: /sell [amount] [token]
+
+<b>Examples:</b>
+• /sell 0.01 sol - Sell 0.01 SOL
+• /sell 1000 bonk - Sell 1000 BONK
+• /sell 0.5 wif - Sell 0.5 WIF
+
+Amount is in token units.""")
 
         elif cmd.startswith("/trade") or cmd.startswith("trade"):
             # Parse trade command: /trade usdc sol or "trade usdc to sol"
