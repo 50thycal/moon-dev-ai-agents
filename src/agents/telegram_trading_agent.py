@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Moon Dev's Telegram Trading Agent - STANDALONE VERSION
+Moon Dev's Telegram Trading Agent - SOLANA/JUPITER VERSION
 
 A simple, self-contained trading bot that works on Railway.
-No complex dependencies - just Telegram + HyperLiquid + OpenAI.
+Uses Jupiter DEX on Solana - works in the US!
 
 Built with love by Moon Dev
 """
@@ -31,15 +31,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # OpenAI
 OPENAI_KEY = os.getenv("OPENAI_KEY", "")
 
-# HyperLiquid
-HL_PRIVATE_KEY = os.getenv("HYPER_LIQUID_ETH_PRIVATE_KEY", "")
+# Solana
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
+RPC_ENDPOINT = os.getenv("RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
+BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+
+# Token Addresses
+USDC_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOL_ADDRESS = "So11111111111111111111111111111111111111111"
 
 # Trading Settings
-SYMBOLS = ["BTC"]
-LEVERAGE = 5
-MAX_POSITION_PERCENTAGE = 50
-STOP_LOSS_PERCENTAGE = 10.0
-TAKE_PROFIT_PERCENTAGE = 15.0
+TOKENS = {
+    "SOL": SOL_ADDRESS,
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+}
+DEFAULT_TOKEN = "SOL"
+TRADE_SIZE_USD = 10  # Default trade size in USD
+SLIPPAGE_BPS = 500  # 5% slippage
 CHECK_INTERVAL_MINUTES = 15
 MIN_CONFIDENCE = 60
 
@@ -109,102 +118,179 @@ def check_telegram_commands() -> str:
         return None
 
 # ============================================================================
-# HYPERLIQUID FUNCTIONS
+# SOLANA/JUPITER FUNCTIONS
 # ============================================================================
 
-def get_hl_price(symbol: str) -> float:
-    """Get current price from HyperLiquid"""
+def get_sol_price() -> float:
+    """Get SOL price from Jupiter"""
     try:
-        url = "https://api.hyperliquid.xyz/info"
-        payload = {"type": "allMids"}
-        response = requests.post(url, json=payload, timeout=10)
+        url = "https://price.jup.ag/v6/price?ids=SOL"
+        response = requests.get(url, timeout=10)
         data = response.json()
-        return float(data.get(symbol, 0))
+        return float(data.get("data", {}).get("SOL", {}).get("price", 0))
     except Exception as e:
         print(f"Price error: {e}")
         return 0
 
-def get_hl_candles(symbol: str, interval: str = "1h", limit: int = 50) -> list:
-    """Get OHLCV candles from HyperLiquid"""
+def get_token_price(symbol: str) -> float:
+    """Get token price from Jupiter"""
     try:
-        url = "https://api.hyperliquid.xyz/info"
-        end_time = int(time.time() * 1000)
-        start_time = end_time - (limit * 3600 * 1000)  # hours back
+        mint = TOKENS.get(symbol, symbol)
+        url = f"https://price.jup.ag/v6/price?ids={mint}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        return float(data.get("data", {}).get(mint, {}).get("price", 0))
+    except Exception as e:
+        print(f"Price error for {symbol}: {e}")
+        return 0
 
-        payload = {
-            "type": "candleSnapshot",
-            "req": {
-                "coin": symbol,
-                "interval": interval,
-                "startTime": start_time,
-                "endTime": end_time
-            }
-        }
-        response = requests.post(url, json=payload, timeout=10)
-        return response.json()
+def get_birdeye_candles(token_address: str, interval: str = "1H", limit: int = 50) -> list:
+    """Get OHLCV candles from Birdeye API"""
+    if not BIRDEYE_API_KEY:
+        print("Birdeye API key not configured")
+        return []
+
+    try:
+        # Birdeye time format
+        end_time = int(time.time())
+
+        # Calculate start time based on interval
+        if interval == "1H":
+            start_time = end_time - (limit * 3600)
+        elif interval == "15m":
+            start_time = end_time - (limit * 900)
+        else:
+            start_time = end_time - (limit * 3600)
+
+        url = f"https://public-api.birdeye.so/defi/ohlcv?address={token_address}&type={interval}&time_from={start_time}&time_to={end_time}"
+        headers = {"X-API-KEY": BIRDEYE_API_KEY}
+        response = requests.get(url, headers=headers, timeout=10)
+        data = response.json()
+
+        if data.get("success"):
+            return data.get("data", {}).get("items", [])
+        return []
     except Exception as e:
         print(f"Candles error: {e}")
         return []
 
-def get_hl_account_value() -> float:
-    """Get account value from HyperLiquid"""
-    if not HL_PRIVATE_KEY:
-        return 0
+def get_wallet_balance() -> dict:
+    """Get wallet SOL and token balances"""
+    if not SOLANA_PRIVATE_KEY:
+        return {"sol": 0, "usdc": 0, "total_usd": 0}
 
     try:
-        from eth_account import Account
-        account = Account.from_key(HL_PRIVATE_KEY)
-        address = account.address
+        from solders.keypair import Keypair
+        keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+        address = str(keypair.pubkey())
 
-        url = "https://api.hyperliquid.xyz/info"
-        payload = {"type": "clearinghouseState", "user": address}
-        response = requests.post(url, json=payload, timeout=10)
+        # Get SOL balance
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBalance",
+            "params": [address]
+        }
+        response = requests.post(RPC_ENDPOINT, json=payload, timeout=10)
+        data = response.json()
+        sol_lamports = data.get("result", {}).get("value", 0)
+        sol_balance = sol_lamports / 1_000_000_000  # Convert lamports to SOL
+
+        # Get SOL price
+        sol_price = get_sol_price()
+        sol_usd = sol_balance * sol_price
+
+        # Get USDC balance (SPL token)
+        usdc_balance = get_token_balance(address, USDC_ADDRESS)
+
+        return {
+            "sol": sol_balance,
+            "sol_usd": sol_usd,
+            "usdc": usdc_balance,
+            "total_usd": sol_usd + usdc_balance,
+            "address": address
+        }
+    except Exception as e:
+        print(f"Balance error: {e}")
+        return {"sol": 0, "usdc": 0, "total_usd": 0}
+
+def get_token_balance(wallet_address: str, token_mint: str) -> float:
+    """Get SPL token balance for wallet"""
+    try:
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getTokenAccountsByOwner",
+            "params": [
+                wallet_address,
+                {"mint": token_mint},
+                {"encoding": "jsonParsed"}
+            ]
+        }
+        response = requests.post(RPC_ENDPOINT, json=payload, timeout=10)
         data = response.json()
 
-        margin_summary = data.get("marginSummary", {})
-        return float(margin_summary.get("accountValue", 0))
+        accounts = data.get("result", {}).get("value", [])
+        if accounts:
+            token_amount = accounts[0].get("account", {}).get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
+            return float(token_amount.get("uiAmount", 0))
+        return 0
     except Exception as e:
-        print(f"Account error: {e}")
+        print(f"Token balance error: {e}")
         return 0
 
-def get_hl_position(symbol: str) -> dict:
-    """Get position for symbol"""
-    if not HL_PRIVATE_KEY:
-        return None
+def execute_swap(input_mint: str, output_mint: str, amount_lamports: int) -> dict:
+    """Execute a swap via Jupiter"""
+    if not SOLANA_PRIVATE_KEY:
+        return {"success": False, "error": "No private key configured"}
 
     try:
-        from eth_account import Account
-        account = Account.from_key(HL_PRIVATE_KEY)
-        address = account.address
+        from solders.keypair import Keypair
+        from solders.transaction import VersionedTransaction
+        from solana.rpc.api import Client
 
-        url = "https://api.hyperliquid.xyz/info"
-        payload = {"type": "clearinghouseState", "user": address}
-        response = requests.post(url, json=payload, timeout=10)
-        data = response.json()
+        keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+        http_client = Client(RPC_ENDPOINT)
 
-        for pos in data.get("assetPositions", []):
-            position = pos.get("position", {})
-            if position.get("coin") == symbol:
-                size = float(position.get("szi", 0))
-                if size != 0:
-                    entry_px = float(position.get("entryPx", 0))
-                    mark_px = get_hl_price(symbol)
-                    pnl_pct = ((mark_px - entry_px) / entry_px * 100) if entry_px else 0
-                    if size < 0:  # Short position
-                        pnl_pct = -pnl_pct
+        # Get quote from Jupiter
+        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount_lamports}&slippageBps={SLIPPAGE_BPS}"
+        quote_response = requests.get(quote_url, timeout=10)
+        quote = quote_response.json()
 
-                    return {
-                        "symbol": symbol,
-                        "size": size,
-                        "entry_price": entry_px,
-                        "mark_price": mark_px,
-                        "pnl_percentage": pnl_pct,
-                        "notional": abs(size) * mark_px
-                    }
-        return None
+        if "error" in quote:
+            return {"success": False, "error": quote.get("error")}
+
+        # Get swap transaction
+        swap_response = requests.post(
+            "https://lite-api.jup.ag/swap/v1/swap",
+            headers={"Content-Type": "application/json"},
+            json={
+                "quoteResponse": quote,
+                "userPublicKey": str(keypair.pubkey()),
+                "wrapUnwrapSOL": True
+            },
+            timeout=30
+        )
+        swap_data = swap_response.json()
+
+        if "error" in swap_data:
+            return {"success": False, "error": swap_data.get("error")}
+
+        # Sign and send transaction
+        import base64
+        tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signed_tx = keypair.sign_message(bytes(tx.message))
+
+        # This is a simplified version - full implementation would need proper signing
+        return {
+            "success": True,
+            "quote": quote,
+            "message": "Swap prepared (manual execution on Jupiter recommended for safety)"
+        }
+
     except Exception as e:
-        print(f"Position error: {e}")
-        return None
+        return {"success": False, "error": str(e)}
 
 # ============================================================================
 # AI ANALYSIS
@@ -218,9 +304,13 @@ def analyze_with_ai(symbol: str, candles: list) -> tuple:
 
     try:
         # Format candle data
-        candle_text = "Recent price data (last 20 candles):\n"
+        candle_text = f"Recent {symbol} price data (last 20 candles):\n"
         for c in candles[-20:]:
-            candle_text += f"Open: {c.get('o', 'N/A')}, High: {c.get('h', 'N/A')}, Low: {c.get('l', 'N/A')}, Close: {c.get('c', 'N/A')}\n"
+            o = c.get('o', c.get('open', 'N/A'))
+            h = c.get('h', c.get('high', 'N/A'))
+            l = c.get('l', c.get('low', 'N/A'))
+            close = c.get('c', c.get('close', 'N/A'))
+            candle_text += f"Open: {o}, High: {h}, Low: {l}, Close: {close}\n"
 
         prompt = f"""Analyze this {symbol} market data and decide: BUY, SELL, or HOLD.
 
@@ -229,8 +319,8 @@ def analyze_with_ai(symbol: str, candles: list) -> tuple:
 Rules:
 - Respond with ONLY one word: BUY, SELL, or HOLD
 - BUY = bullish, good entry point
-- SELL = bearish, exit or short
-- HOLD = unclear, wait
+- SELL = bearish, exit or take profits
+- HOLD = unclear, wait for better setup
 
 Your decision:"""
 
@@ -280,9 +370,11 @@ class TelegramTradingBot:
         self.running = True
         self.daily_trades = 0
         self.last_trade_date = datetime.now().date()
+        self.active_token = DEFAULT_TOKEN
 
         print("=" * 50)
         print("Moon Dev Telegram Trading Bot")
+        print("Exchange: Solana + Jupiter DEX")
         print("=" * 50)
 
         # Check configuration
@@ -296,74 +388,88 @@ class TelegramTradingBot:
         else:
             print("OpenAI: OK")
 
-        if not HL_PRIVATE_KEY:
-            print("WARNING: HyperLiquid not configured!")
+        if not SOLANA_PRIVATE_KEY:
+            print("WARNING: Solana wallet not configured!")
         else:
-            print("HyperLiquid: OK")
+            print("Solana Wallet: OK")
 
-        print(f"Symbols: {SYMBOLS}")
-        print(f"Leverage: {LEVERAGE}x")
+        if not BIRDEYE_API_KEY:
+            print("WARNING: Birdeye API not configured (using Jupiter for prices)")
+        else:
+            print("Birdeye: OK")
+
+        print(f"Active Token: {self.active_token}")
         print(f"Check interval: {CHECK_INTERVAL_MINUTES} min")
         print("=" * 50)
 
-        # Send startup message
-        send_telegram(f"""<b>🌙 Moon Dev Trading Bot Started!</b>
+        # Get wallet info
+        wallet = get_wallet_balance()
 
-<b>Exchange:</b> HyperLiquid
-<b>Symbols:</b> {', '.join(SYMBOLS)}
-<b>Leverage:</b> {LEVERAGE}x
+        # Send startup message
+        send_telegram(f"""<b>Moon Dev Trading Bot Started!</b>
+
+<b>Exchange:</b> Solana + Jupiter DEX
+<b>Token:</b> {self.active_token}
 <b>Interval:</b> {CHECK_INTERVAL_MINUTES} min
+
+<b>Wallet:</b>
+SOL: {wallet.get('sol', 0):.4f} (${wallet.get('sol_usd', 0):.2f})
+USDC: ${wallet.get('usdc', 0):.2f}
+<b>Total:</b> ${wallet.get('total_usd', 0):.2f}
 
 Send /help for commands""")
 
     def handle_command(self, cmd: str):
         """Handle Telegram command"""
         if cmd == "/help" or cmd == "/start":
-            send_telegram("""<b>🤖 Trading Bot Commands</b>
+            send_telegram("""<b>Trading Bot Commands</b>
 
-/status - Check balance & positions
-/pause - Pause trading
-/resume - Resume trading
-/price - Get current BTC price
+/status - Check wallet balance
+/price - Get current SOL price
+/tokens - List available tokens
+/pause - Pause trading signals
+/resume - Resume trading signals
 /help - Show this message
 
-Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes""")
+<b>Available Tokens:</b> SOL, BONK, WIF
+
+Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes
+<i>Note: This is a SIGNAL bot - trades require manual execution on Jupiter</i>""")
 
         elif cmd == "/status":
-            balance = get_hl_account_value()
-            pos_text = ""
+            wallet = get_wallet_balance()
+            status = "PAUSED" if self.is_paused else "ACTIVE"
 
-            for symbol in SYMBOLS:
-                pos = get_hl_position(symbol)
-                if pos:
-                    emoji = "📈" if pos["pnl_percentage"] >= 0 else "📉"
-                    pos_text += f"\n{symbol}: {pos['pnl_percentage']:+.2f}% {emoji}"
-
-            if not pos_text:
-                pos_text = "\nNo open positions"
-
-            status = "⏸️ PAUSED" if self.is_paused else "✅ ACTIVE"
-
-            send_telegram(f"""<b>📊 Bot Status</b>
+            send_telegram(f"""<b>Bot Status</b>
 
 <b>Status:</b> {status}
-<b>Balance:</b> ${balance:,.2f}
-<b>Today's Trades:</b> {self.daily_trades}
+<b>Active Token:</b> {self.active_token}
+<b>Today's Signals:</b> {self.daily_trades}
 
-<b>Positions:</b>{pos_text}""")
+<b>Wallet Balance:</b>
+SOL: {wallet.get('sol', 0):.4f} (${wallet.get('sol_usd', 0):.2f})
+USDC: ${wallet.get('usdc', 0):.2f}
+<b>Total:</b> ${wallet.get('total_usd', 0):.2f}""")
 
         elif cmd == "/pause":
             self.is_paused = True
-            send_telegram("⏸️ <b>Trading Paused</b>\n\nSend /resume to continue")
+            send_telegram("<b>Trading Signals Paused</b>\n\nSend /resume to continue")
 
         elif cmd == "/resume":
             self.is_paused = False
-            send_telegram("▶️ <b>Trading Resumed</b>")
+            send_telegram("<b>Trading Signals Resumed</b>")
 
         elif cmd == "/price":
-            for symbol in SYMBOLS:
-                price = get_hl_price(symbol)
-                send_telegram(f"💰 <b>{symbol}</b>: ${price:,.2f}")
+            sol_price = get_sol_price()
+            send_telegram(f"<b>SOL:</b> ${sol_price:,.2f}")
+
+        elif cmd == "/tokens":
+            token_list = "\n".join([f"- {name}" for name in TOKENS.keys()])
+            send_telegram(f"""<b>Available Tokens:</b>
+
+{token_list}
+
+Current: {self.active_token}""")
 
     def run_cycle(self):
         """Run one trading cycle"""
@@ -373,56 +479,52 @@ Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes""")
 
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Running trading cycle...")
 
-        for symbol in SYMBOLS:
-            try:
-                # Get market data
-                price = get_hl_price(symbol)
-                candles = get_hl_candles(symbol, "1h", 50)
+        try:
+            symbol = self.active_token
+            token_address = TOKENS.get(symbol, SOL_ADDRESS)
 
-                if not candles:
-                    print(f"No candles for {symbol}")
-                    continue
+            # Get price
+            price = get_token_price(symbol)
+            print(f"{symbol}: ${price:,.4f}")
 
-                print(f"{symbol}: ${price:,.2f}")
+            # Get candles (if Birdeye is configured)
+            candles = []
+            if BIRDEYE_API_KEY:
+                candles = get_birdeye_candles(token_address, "1H", 50)
 
-                # Check current position
-                pos = get_hl_position(symbol)
-                has_position = pos is not None
+            if not candles:
+                # Use simple price-based analysis
+                print("No candle data, using price-only analysis")
+                candles = [{"close": price}]
 
-                if has_position:
-                    print(f"Position: {pos['size']} @ ${pos['entry_price']:,.2f}, P&L: {pos['pnl_percentage']:+.2f}%")
+            # Get AI analysis
+            action, confidence, reasoning = analyze_with_ai(symbol, candles)
+            print(f"AI Decision: {action} ({confidence}%)")
 
-                    # Check stop loss / take profit
-                    if pos["pnl_percentage"] <= -STOP_LOSS_PERCENTAGE:
-                        send_telegram(f"🛑 <b>STOP LOSS</b> - {symbol}\n\nP&L: {pos['pnl_percentage']:+.2f}%\n\n<i>Manual close recommended</i>")
-                    elif pos["pnl_percentage"] >= TAKE_PROFIT_PERCENTAGE:
-                        send_telegram(f"🎯 <b>TAKE PROFIT</b> - {symbol}\n\nP&L: {pos['pnl_percentage']:+.2f}%\n\n<i>Consider taking profits</i>")
+            # Alert on high-confidence signals
+            if confidence >= MIN_CONFIDENCE and action != "HOLD":
+                self.daily_trades += 1
 
-                # Get AI analysis
-                action, confidence, reasoning = analyze_with_ai(symbol, candles)
-                print(f"AI Decision: {action} ({confidence}%)")
+                if action == "BUY":
+                    send_telegram(f"""<b>BUY SIGNAL</b> - {symbol}
 
-                # Alert on high-confidence signals
-                if confidence >= MIN_CONFIDENCE:
-                    if action == "BUY" and not has_position:
-                        send_telegram(f"""📈 <b>BUY SIGNAL</b> - {symbol}
-
-<b>Price:</b> ${price:,.2f}
+<b>Price:</b> ${price:,.4f}
 <b>Confidence:</b> {confidence}%
 
-<i>This is a signal only - manual trade required on HyperLiquid</i>""")
+<i>Execute on Jupiter: jup.ag</i>
+<i>This is a signal only - manual trade required</i>""")
 
-                    elif action == "SELL" and has_position:
-                        send_telegram(f"""📉 <b>SELL SIGNAL</b> - {symbol}
+                elif action == "SELL":
+                    send_telegram(f"""<b>SELL SIGNAL</b> - {symbol}
 
-<b>Price:</b> ${price:,.2f}
+<b>Price:</b> ${price:,.4f}
 <b>Confidence:</b> {confidence}%
-<b>Current P&L:</b> {pos['pnl_percentage']:+.2f}%
 
-<i>Consider closing position</i>""")
+<i>Execute on Jupiter: jup.ag</i>
+<i>Consider taking profits if in position</i>""")
 
-            except Exception as e:
-                print(f"Error analyzing {symbol}: {e}")
+        except Exception as e:
+            print(f"Error in cycle: {e}")
 
     def run(self):
         """Main loop"""
@@ -460,7 +562,7 @@ Bot checks markets every """ + str(CHECK_INTERVAL_MINUTES) + """ minutes""")
             except KeyboardInterrupt:
                 print("\nShutting down...")
                 self.running = False
-                send_telegram("🛑 <b>Bot Stopped</b>")
+                send_telegram("<b>Bot Stopped</b>")
             except Exception as e:
                 print(f"Error in main loop: {e}")
                 time.sleep(60)
