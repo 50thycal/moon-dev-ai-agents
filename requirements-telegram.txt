@@ -1,4 +1,4 @@
-# Minimal requirements for Telegram Trading Bot
+# Minimal requirements for Telegram Trading Bot (Solana/Jupiter version)
 # Use this for Railway deployment
 
 # Core
@@ -8,16 +8,14 @@ termcolor>=2.3.0
 pandas>=2.0.0
 
 # AI Models
-anthropic>=0.40.0
 openai>=1.0.0
 
 # Web/Async
-aiohttp>=3.9.0
 httpx>=0.25.0
 
-# Crypto/Trading (for Aster/HyperLiquid)
-eth-account>=0.10.0
-web3>=6.0.0
+# Solana/Crypto
+solders>=0.18.0
+solana>=0.30.0
 
 # Data
 numpy>=1.24.0
