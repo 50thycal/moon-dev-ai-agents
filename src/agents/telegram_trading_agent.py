@@ -299,7 +299,7 @@ def get_token_balance(wallet_address: str, token_mint: str) -> float:
         return 0
 
 def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
-    """Execute a swap via Jupiter - REAL EXECUTION"""
+    """Execute a swap via Jupiter - using direct HTTP calls (no solana SDK needed)"""
     if not SOLANA_PRIVATE_KEY:
         return {"success": False, "error": "No private key configured"}
 
@@ -307,12 +307,8 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
         import base64
         from solders.keypair import Keypair
         from solders.transaction import VersionedTransaction
-        from solana.rpc.api import Client
-        from solana.rpc.types import TxOpts
-        from solana.rpc.commitment import Confirmed
 
         keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
-        http_client = Client(RPC_ENDPOINT)
 
         print(f"Executing swap: {input_mint[:8]}... -> {output_mint[:8]}...")
         print(f"Amount: {amount}")
@@ -357,17 +353,34 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
         tx_bytes = base64.b64decode(swap_data["swapTransaction"])
         tx = VersionedTransaction.from_bytes(tx_bytes)
 
-        # Sign the transaction
+        # Sign the transaction using solders
         signed_tx = VersionedTransaction(tx.message, [keypair])
+        signed_tx_bytes = bytes(signed_tx)
+        signed_tx_base64 = base64.b64encode(signed_tx_bytes).decode('utf-8')
 
-        # Send transaction
+        # Send transaction using direct HTTP call to Solana RPC (no SDK needed!)
         print("Sending transaction...")
-        opts = TxOpts(skip_preflight=False, preflight_commitment=Confirmed)
-        result = http_client.send_transaction(signed_tx, opts=opts)
+        rpc_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3
+                }
+            ]
+        }
+
+        rpc_response = requests.post(RPC_ENDPOINT, json=rpc_payload, timeout=30)
+        rpc_result = rpc_response.json()
 
         # Check result
-        if hasattr(result, 'value'):
-            tx_sig = str(result.value)
+        if "result" in rpc_result:
+            tx_sig = rpc_result["result"]
             print(f"Transaction sent: {tx_sig}")
             return {
                 "success": True,
@@ -375,8 +388,11 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
                 "out_amount": out_amount,
                 "url": f"https://solscan.io/tx/{tx_sig}"
             }
+        elif "error" in rpc_result:
+            error_msg = rpc_result["error"].get("message", str(rpc_result["error"]))
+            return {"success": False, "error": f"RPC error: {error_msg}"}
         else:
-            return {"success": False, "error": f"Transaction failed: {result}"}
+            return {"success": False, "error": f"Unknown RPC response: {rpc_result}"}
 
     except Exception as e:
         print(f"Swap error: {e}")

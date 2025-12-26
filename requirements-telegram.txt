@@ -1,5 +1,5 @@
 # Moon Dev Telegram Trading Bot - Railway Requirements
-# Last updated: 2025-12-26 - Force rebuild v2
+# Last updated: 2025-12-26 - Removed solana SDK, using direct HTTP
 
 # Core
 python-dotenv>=1.0.0
@@ -13,9 +13,8 @@ openai>=1.0.0
 # Web/Async
 httpx>=0.25.0
 
-# Solana/Crypto
+# Solana/Crypto - only need solders for keypair/tx, no SDK!
 solders>=0.18.0
-solana>=0.30.0
 
 # Data
 numpy>=1.24.0
