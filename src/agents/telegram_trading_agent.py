@@ -36,14 +36,10 @@ SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
 RPC_ENDPOINT = os.getenv("RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 
-# Moon Dev API (for whale/funding/liquidation data)
-MOONDEV_API_KEY = os.getenv("MOONDEV_API_KEY", "")
-MOONDEV_API_URL = "http://api.moondev.com:8000"
-
-# Whale Detection Settings
-WHALE_CHECK_INTERVAL = 5  # Minutes between whale checks
-WHALE_THRESHOLD_MULTIPLIER = 1.25  # 25% above average = whale activity
-OI_HISTORY = []  # Store recent OI data points for comparison
+# Alert Thresholds
+FEAR_GREED_EXTREME_LOW = 25   # Below this = extreme fear (buy signal)
+FEAR_GREED_EXTREME_HIGH = 75  # Above this = extreme greed (sell signal)
+PRICE_ALERT_THRESHOLD = 7     # % change to trigger big move alert
 
 # Token Addresses
 USDC_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -77,155 +73,209 @@ AGENT_DATA = {
 }
 
 # ============================================================================
-# WHALE DATA FUNCTIONS
+# FREE DATA FEEDS (No API keys required)
 # ============================================================================
 
-def fetch_oi_data() -> dict:
-    """Fetch open interest data from Moon Dev API"""
-    if not MOONDEV_API_KEY:
-        print("Moon Dev API key not configured - whale data unavailable")
-        return None
-
+def fetch_fear_greed() -> dict:
+    """Fetch Fear & Greed Index from alternative.me (FREE, no API key)"""
     try:
-        headers = {"X-API-Key": MOONDEV_API_KEY}
-        url = f"{MOONDEV_API_URL}/files/oi.csv"
+        url = "https://api.alternative.me/fng/?limit=1"
+        response = requests.get(url, timeout=10)
 
-        response = requests.get(url, headers=headers, timeout=30)
         if response.status_code != 200:
-            print(f"OI API error: {response.status_code}")
+            print(f"Fear & Greed API error: {response.status_code}")
             return None
 
-        # Parse CSV response
-        lines = response.text.strip().split('\n')
-        if len(lines) < 2:
-            return None
-
-        # Parse header and find columns
-        header = lines[0].split(',')
-
-        # Find latest BTC data
-        btc_oi = None
-        btc_price = None
-
-        for line in reversed(lines[1:]):
-            fields = line.split(',')
-            if len(fields) >= len(header):
-                # Create dict from fields
-                row = dict(zip(header, fields))
-                if row.get('symbol') == 'BTCUSDT':
-                    try:
-                        btc_oi = float(row.get('openInterest', 0))
-                        btc_price = float(row.get('price', 0))
-                        break
-                    except:
-                        continue
-
-        if btc_oi and btc_price:
-            btc_oi_usd = btc_oi * btc_price
+        data = response.json()
+        if data.get("data"):
+            fng = data["data"][0]
             return {
-                "btc_oi": btc_oi,
-                "btc_oi_usd": btc_oi_usd,
-                "btc_price": btc_price,
+                "value": int(fng.get("value", 50)),
+                "classification": fng.get("value_classification", "Neutral"),
                 "timestamp": datetime.now()
             }
-
         return None
 
     except Exception as e:
-        print(f"Error fetching OI data: {e}")
+        print(f"Error fetching Fear & Greed: {e}")
         return None
 
 
-def update_whale_data():
-    """Update whale detection data - call this periodically"""
-    global OI_HISTORY
+def fetch_sol_market_data() -> dict:
+    """Fetch SOL market data from CoinGecko (FREE, no API key)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/solana"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "community_data": "false",
+            "developer_data": "false"
+        }
+        response = requests.get(url, params=params, timeout=10)
 
-    oi_data = fetch_oi_data()
-    if not oi_data:
+        if response.status_code != 200:
+            print(f"CoinGecko API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        market = data.get("market_data", {})
+
+        return {
+            "price": market.get("current_price", {}).get("usd", 0),
+            "price_change_24h": market.get("price_change_percentage_24h", 0),
+            "price_change_7d": market.get("price_change_percentage_7d", 0),
+            "volume_24h": market.get("total_volume", {}).get("usd", 0),
+            "volume_change_24h": market.get("volume_change_24h", 0) if "volume_change_24h" in market else 0,
+            "market_cap": market.get("market_cap", {}).get("usd", 0),
+            "ath": market.get("ath", {}).get("usd", 0),
+            "ath_change": market.get("ath_change_percentage", {}).get("usd", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching SOL market data: {e}")
+        return None
+
+
+def update_sentiment_data():
+    """Update sentiment from Fear & Greed Index"""
+    fng = fetch_fear_greed()
+    if not fng:
         return
 
-    # Add to history
-    OI_HISTORY.append(oi_data)
+    value = fng["value"]
+    classification = fng["classification"]
 
-    # Keep only last 20 data points (for rolling average)
-    if len(OI_HISTORY) > 20:
-        OI_HISTORY = OI_HISTORY[-20:]
+    # Determine signal based on Fear & Greed
+    # Extreme Fear (<25) = potential buy opportunity
+    # Extreme Greed (>75) = potential sell signal
+    if value <= 25:
+        signal = "BULLISH"  # Extreme fear = buy opportunity
+        message = f"Extreme Fear ({value}/100) - Potential buy opportunity"
+    elif value <= 40:
+        signal = "NEUTRAL"
+        message = f"Fear ({value}/100) - Market cautious"
+    elif value <= 60:
+        signal = "NEUTRAL"
+        message = f"Neutral ({value}/100) - Market indecisive"
+    elif value <= 75:
+        signal = "NEUTRAL"
+        message = f"Greed ({value}/100) - Market confident"
+    else:
+        signal = "BEARISH"  # Extreme greed = potential top
+        message = f"Extreme Greed ({value}/100) - Potential correction ahead"
 
-    # Need at least 3 data points to detect changes
-    if len(OI_HISTORY) < 3:
-        AGENT_DATA["whale"]["message"] = "Building OI history..."
-        AGENT_DATA["whale"]["updated"] = datetime.now()
+    AGENT_DATA["sentiment"]["signal"] = signal
+    AGENT_DATA["sentiment"]["message"] = message
+    AGENT_DATA["sentiment"]["updated"] = datetime.now()
+    AGENT_DATA["sentiment"]["value"] = value
+    AGENT_DATA["sentiment"]["classification"] = classification
+
+    print(f"Sentiment update: {signal} - {message}")
+
+
+def update_volume_data():
+    """Update volume/market data for SOL"""
+    market = fetch_sol_market_data()
+    if not market:
         return
 
-    # Calculate current change
-    current = OI_HISTORY[-1]["btc_oi_usd"]
-    previous = OI_HISTORY[-2]["btc_oi_usd"]
-    pct_change = ((current - previous) / previous) * 100
+    price_change = market["price_change_24h"]
+    volume = market["volume_24h"]
 
-    # Calculate average absolute change
-    changes = []
-    for i in range(1, len(OI_HISTORY)):
-        prev = OI_HISTORY[i-1]["btc_oi_usd"]
-        curr = OI_HISTORY[i]["btc_oi_usd"]
-        changes.append(abs((curr - prev) / prev * 100))
-
-    avg_change = sum(changes) / len(changes) if changes else 0
-    threshold = avg_change * WHALE_THRESHOLD_MULTIPLIER
-
-    # Detect whale activity
-    is_whale = abs(pct_change) > threshold and abs(pct_change) > 0.1  # Min 0.1% change
-
-    # Format message
-    direction = "up" if pct_change > 0 else "down"
-    current_b = current / 1e9  # Convert to billions
-
-    if is_whale:
-        if pct_change > 0:
-            signal = "BULLISH"
-            message = f"Whale accumulation detected. BTC OI {direction} {abs(pct_change):.2f}% (${current_b:.2f}B)"
-        else:
-            signal = "BEARISH"
-            message = f"Whale distribution detected. BTC OI {direction} {abs(pct_change):.2f}% (${current_b:.2f}B)"
+    # Determine signal based on price momentum and volume
+    if price_change > 5:
+        signal = "BULLISH"
+        message = f"SOL up {price_change:.1f}% (24h), Vol: ${volume/1e9:.2f}B"
+    elif price_change > 2:
+        signal = "NEUTRAL"
+        message = f"SOL up {price_change:.1f}% (24h), moderate momentum"
+    elif price_change < -5:
+        signal = "BEARISH"
+        message = f"SOL down {abs(price_change):.1f}% (24h), Vol: ${volume/1e9:.2f}B"
+    elif price_change < -2:
+        signal = "NEUTRAL"
+        message = f"SOL down {abs(price_change):.1f}% (24h), minor pullback"
     else:
         signal = "NEUTRAL"
-        message = f"BTC OI {direction} {abs(pct_change):.2f}% (${current_b:.2f}B) - normal activity"
+        message = f"SOL flat ({price_change:+.1f}%), consolidating"
 
-    AGENT_DATA["whale"]["signal"] = signal
-    AGENT_DATA["whale"]["message"] = message
-    AGENT_DATA["whale"]["updated"] = datetime.now()
-    AGENT_DATA["whale"]["pct_change"] = pct_change
-    AGENT_DATA["whale"]["is_whale"] = is_whale
+    AGENT_DATA["volume"]["signal"] = signal
+    AGENT_DATA["volume"]["message"] = message
+    AGENT_DATA["volume"]["updated"] = datetime.now()
+    AGENT_DATA["volume"]["price_change"] = price_change
+    AGENT_DATA["volume"]["volume_24h"] = volume
+    AGENT_DATA["volume"]["market_data"] = market
 
-    print(f"Whale update: {signal} - {message}")
+    print(f"Volume update: {signal} - {message}")
 
 
-def get_whale_status() -> str:
-    """Get formatted whale status for Telegram"""
-    data = AGENT_DATA.get("whale", {})
+def get_sentiment_status() -> str:
+    """Get formatted sentiment status for Telegram"""
+    data = AGENT_DATA.get("sentiment", {})
 
     if not data.get("updated"):
-        return "No whale data available yet. Need MOONDEV_API_KEY configured."
+        return "No sentiment data available yet."
 
     age = datetime.now() - data["updated"]
     age_mins = age.total_seconds() / 60
 
-    if age_mins > 30:
-        return "Whale data is stale (>30 min old). Checking..."
+    value = data.get("value", 50)
+    classification = data.get("classification", "Neutral")
+    signal = data.get("signal", "NEUTRAL")
 
-    signal = data.get("signal", "UNKNOWN")
-    message = data.get("message", "No data")
-    is_whale = data.get("is_whale", False)
+    # Fear & Greed emoji scale
+    if value <= 25:
+        emoji = "😱"
+    elif value <= 40:
+        emoji = "😰"
+    elif value <= 60:
+        emoji = "😐"
+    elif value <= 75:
+        emoji = "😊"
+    else:
+        emoji = "🤑"
 
-    emoji = "🐋" if is_whale else "🔵"
     signal_emoji = "🟢" if signal == "BULLISH" else "🔴" if signal == "BEARISH" else "⚪"
 
-    return f"""{emoji} <b>Whale Status</b>
+    return f"""{emoji} <b>Market Sentiment</b>
 
+<b>Fear & Greed:</b> {value}/100 ({classification})
 <b>Signal:</b> {signal_emoji} {signal}
-<b>Activity:</b> {message}
 <b>Updated:</b> {age_mins:.0f} min ago
 
-{'<b>⚠️ WHALE ALERT!</b> Large OI movement detected!' if is_whale else '<i>Normal market activity</i>'}"""
+<i>{'Buy opportunity - others are fearful' if value <= 25 else 'Caution - market may be overheated' if value >= 75 else 'Normal market conditions'}</i>"""
+
+
+def get_market_status() -> str:
+    """Get formatted market status for Telegram"""
+    data = AGENT_DATA.get("volume", {})
+
+    if not data.get("updated"):
+        return "No market data available yet."
+
+    age = datetime.now() - data["updated"]
+    age_mins = age.total_seconds() / 60
+
+    market = data.get("market_data", {})
+    price = market.get("price", 0)
+    change_24h = market.get("price_change_24h", 0)
+    change_7d = market.get("price_change_7d", 0)
+    volume = market.get("volume_24h", 0)
+    ath = market.get("ath", 0)
+    ath_change = market.get("ath_change", 0)
+
+    trend_emoji = "📈" if change_24h > 0 else "📉"
+
+    return f"""{trend_emoji} <b>SOL Market Data</b>
+
+<b>Price:</b> ${price:,.2f}
+<b>24h Change:</b> {change_24h:+.2f}%
+<b>7d Change:</b> {change_7d:+.2f}%
+<b>24h Volume:</b> ${volume/1e9:.2f}B
+<b>ATH:</b> ${ath:,.2f} ({ath_change:.1f}%)
+
+<b>Updated:</b> {age_mins:.0f} min ago"""
 
 
 # ============================================================================
@@ -920,7 +970,8 @@ Send /auto to enable AI trading""")
 /status - Bot status + wallet
 /price [token] - Get price
 /analyze - Run AI analysis now
-/whale - Check whale activity (BTC OI)
+/sentiment - Fear & Greed Index
+/market - SOL market data
 
 <b>Controls:</b>
 /pause - Pause all trading
@@ -1101,10 +1152,15 @@ Reply /cancel to skip"""
 
             send_telegram(msg)
 
-        elif cmd == "/whale" or cmd == "/whales":
-            send_telegram("<b>Checking whale activity...</b>")
-            update_whale_data()
-            send_telegram(get_whale_status())
+        elif cmd == "/sentiment" or cmd == "/fear" or cmd == "/greed":
+            send_telegram("<b>Checking market sentiment...</b>")
+            update_sentiment_data()
+            send_telegram(get_sentiment_status())
+
+        elif cmd == "/market" or cmd == "/sol":
+            send_telegram("<b>Fetching SOL market data...</b>")
+            update_volume_data()
+            send_telegram(get_market_status())
 
         elif cmd.startswith("/buy") or cmd.startswith("buy "):
             # Parse various formats:
@@ -1280,24 +1336,41 @@ Or /trade usdc sol to get a swap link""")
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Running trading cycle...")
 
         try:
-            # Update whale data (external agent feed)
-            if MOONDEV_API_KEY:
-                print("Updating whale data...")
-                old_whale_status = AGENT_DATA.get("whale", {}).get("is_whale", False)
-                update_whale_data()
-                new_whale_status = AGENT_DATA.get("whale", {}).get("is_whale", False)
+            # Update free data feeds (sentiment + market data)
+            print("Updating sentiment data...")
+            old_sentiment = AGENT_DATA.get("sentiment", {}).get("value", 50)
+            update_sentiment_data()
+            new_sentiment = AGENT_DATA.get("sentiment", {}).get("value", 50)
 
-                # Alert on new whale activity
-                if new_whale_status and not old_whale_status:
-                    whale_msg = AGENT_DATA["whale"].get("message", "")
-                    whale_signal = AGENT_DATA["whale"].get("signal", "")
-                    emoji = "🟢" if whale_signal == "BULLISH" else "🔴"
-                    send_telegram(f"""<b>🐋 WHALE ALERT!</b>
+            # Alert on extreme sentiment changes
+            if new_sentiment <= 25 and old_sentiment > 25:
+                send_telegram(f"""<b>😱 EXTREME FEAR ALERT!</b>
 
-{emoji} <b>{whale_signal}</b>
-{whale_msg}
+Fear & Greed: {new_sentiment}/100
+<b>Signal:</b> 🟢 BULLISH
 
-<i>This may impact trading decisions.</i>""")
+<i>Market is fearful - potential buy opportunity!</i>""")
+            elif new_sentiment >= 75 and old_sentiment < 75:
+                send_telegram(f"""<b>🤑 EXTREME GREED ALERT!</b>
+
+Fear & Greed: {new_sentiment}/100
+<b>Signal:</b> 🔴 BEARISH
+
+<i>Market may be overheated - consider taking profits!</i>""")
+
+            print("Updating market data...")
+            update_volume_data()
+
+            # Alert on big price moves
+            price_change = AGENT_DATA.get("volume", {}).get("price_change", 0)
+            if abs(price_change) > 7:
+                direction = "up" if price_change > 0 else "down"
+                emoji = "🚀" if price_change > 0 else "💥"
+                send_telegram(f"""<b>{emoji} BIG MOVE ALERT!</b>
+
+SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
+
+<i>Check /market for details</i>""")
 
             symbol = self.active_token
             token_address = TOKENS.get(symbol, SOL_ADDRESS)
