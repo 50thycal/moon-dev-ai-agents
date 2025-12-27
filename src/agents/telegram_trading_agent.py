@@ -65,11 +65,10 @@ AUTO_MAX_DAILY_TRADES = 5  # Max trades per day in auto mode
 
 # External Agent Data (will be populated by agent feeds)
 AGENT_DATA = {
-    "whale": {"signal": None, "message": "", "updated": None},
-    "funding": {"signal": None, "message": "", "updated": None},
-    "liquidation": {"signal": None, "message": "", "updated": None},
-    "volume": {"signal": None, "message": "", "updated": None},
     "sentiment": {"signal": None, "message": "", "updated": None},
+    "volume": {"signal": None, "message": "", "updated": None},
+    "tvl": {"signal": None, "message": "", "updated": None},
+    "dominance": {"signal": None, "message": "", "updated": None},
 }
 
 # ============================================================================
@@ -276,6 +275,318 @@ def get_market_status() -> str:
 <b>ATH:</b> ${ath:,.2f} ({ath_change:.1f}%)
 
 <b>Updated:</b> {age_mins:.0f} min ago"""
+
+
+def fetch_trending_coins() -> list:
+    """Fetch trending coins from CoinGecko (FREE)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/search/trending"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"CoinGecko trending API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        coins = data.get("coins", [])
+
+        trending = []
+        for coin in coins[:7]:  # Top 7
+            item = coin.get("item", {})
+            trending.append({
+                "name": item.get("name", "Unknown"),
+                "symbol": item.get("symbol", "???").upper(),
+                "rank": item.get("market_cap_rank", 0),
+                "price_btc": item.get("price_btc", 0),
+                "score": item.get("score", 0) + 1  # 0-indexed
+            })
+
+        return trending
+
+    except Exception as e:
+        print(f"Error fetching trending: {e}")
+        return None
+
+
+def fetch_btc_dominance() -> dict:
+    """Fetch BTC dominance and global market data from CoinGecko (FREE)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/global"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"CoinGecko global API error: {response.status_code}")
+            return None
+
+        data = response.json().get("data", {})
+
+        return {
+            "btc_dominance": data.get("market_cap_percentage", {}).get("btc", 0),
+            "eth_dominance": data.get("market_cap_percentage", {}).get("eth", 0),
+            "total_market_cap": data.get("total_market_cap", {}).get("usd", 0),
+            "total_volume": data.get("total_volume", {}).get("usd", 0),
+            "market_cap_change_24h": data.get("market_cap_change_percentage_24h_usd", 0),
+            "active_cryptocurrencies": data.get("active_cryptocurrencies", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching BTC dominance: {e}")
+        return None
+
+
+def fetch_solana_tvl() -> dict:
+    """Fetch Solana TVL from DeFiLlama (FREE)"""
+    try:
+        url = "https://api.llama.fi/v2/chains"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"DeFiLlama API error: {response.status_code}")
+            return None
+
+        chains = response.json()
+
+        # Find Solana
+        solana = None
+        for chain in chains:
+            if chain.get("name", "").lower() == "solana":
+                solana = chain
+                break
+
+        if not solana:
+            return None
+
+        return {
+            "tvl": solana.get("tvl", 0),
+            "change_1d": solana.get("change_1d", 0),
+            "change_7d": solana.get("change_7d", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching Solana TVL: {e}")
+        return None
+
+
+def fetch_top_gainers() -> dict:
+    """Fetch top gainers and losers from CoinGecko (FREE)"""
+    try:
+        # Get top coins by market cap with price changes
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 100,
+            "page": 1,
+            "sparkline": "false",
+            "price_change_percentage": "24h"
+        }
+        response = requests.get(url, params=params, timeout=15)
+
+        if response.status_code != 200:
+            print(f"CoinGecko markets API error: {response.status_code}")
+            return None
+
+        coins = response.json()
+
+        # Sort by 24h change
+        sorted_coins = sorted(coins, key=lambda x: x.get("price_change_percentage_24h") or 0, reverse=True)
+
+        gainers = []
+        for coin in sorted_coins[:5]:
+            gainers.append({
+                "name": coin.get("name", "Unknown"),
+                "symbol": coin.get("symbol", "???").upper(),
+                "price": coin.get("current_price", 0),
+                "change_24h": coin.get("price_change_percentage_24h", 0)
+            })
+
+        losers = []
+        for coin in sorted_coins[-5:]:
+            losers.append({
+                "name": coin.get("name", "Unknown"),
+                "symbol": coin.get("symbol", "???").upper(),
+                "price": coin.get("current_price", 0),
+                "change_24h": coin.get("price_change_percentage_24h", 0)
+            })
+
+        return {
+            "gainers": gainers,
+            "losers": list(reversed(losers)),  # Worst first
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching top gainers: {e}")
+        return None
+
+
+def get_trending_status() -> str:
+    """Get formatted trending coins for Telegram"""
+    trending = fetch_trending_coins()
+
+    if not trending:
+        return "Could not fetch trending coins."
+
+    lines = ["🔥 <b>Trending Coins</b>\n"]
+
+    for i, coin in enumerate(trending):
+        rank = coin.get("rank", "?")
+        rank_str = f"#{rank}" if rank else ""
+        lines.append(f"{i+1}. <b>{coin['symbol']}</b> - {coin['name']} {rank_str}")
+
+    lines.append("\n<i>Source: CoinGecko</i>")
+
+    return "\n".join(lines)
+
+
+def get_btc_dominance_status() -> str:
+    """Get formatted BTC dominance for Telegram"""
+    data = fetch_btc_dominance()
+
+    if not data:
+        return "Could not fetch market data."
+
+    btc_dom = data["btc_dominance"]
+    eth_dom = data["eth_dominance"]
+    total_cap = data["total_market_cap"]
+    cap_change = data["market_cap_change_24h"]
+
+    # Determine alt season signal
+    if btc_dom < 40:
+        signal = "🚀 ALT SEASON"
+        signal_msg = "BTC dominance low - alts outperforming"
+    elif btc_dom > 55:
+        signal = "🔶 BTC SEASON"
+        signal_msg = "BTC dominance high - alts underperforming"
+    else:
+        signal = "⚖️ BALANCED"
+        signal_msg = "Market in equilibrium"
+
+    trend_emoji = "📈" if cap_change > 0 else "📉"
+
+    return f"""₿ <b>Market Dominance</b>
+
+<b>BTC:</b> {btc_dom:.1f}%
+<b>ETH:</b> {eth_dom:.1f}%
+<b>Others:</b> {100 - btc_dom - eth_dom:.1f}%
+
+{trend_emoji} <b>Total Market Cap:</b> ${total_cap/1e12:.2f}T ({cap_change:+.1f}%)
+
+<b>Signal:</b> {signal}
+<i>{signal_msg}</i>"""
+
+
+def get_tvl_status() -> str:
+    """Get formatted Solana TVL for Telegram"""
+    data = fetch_solana_tvl()
+
+    if not data:
+        return "Could not fetch TVL data."
+
+    tvl = data["tvl"]
+    change_1d = data.get("change_1d", 0) or 0
+    change_7d = data.get("change_7d", 0) or 0
+
+    # Determine signal
+    if change_1d > 3:
+        signal = "BULLISH"
+        signal_emoji = "🟢"
+        msg = "Money flowing into Solana DeFi"
+    elif change_1d < -3:
+        signal = "BEARISH"
+        signal_emoji = "🔴"
+        msg = "Money leaving Solana DeFi"
+    else:
+        signal = "NEUTRAL"
+        signal_emoji = "⚪"
+        msg = "Stable TVL"
+
+    trend_emoji = "📈" if change_1d > 0 else "📉"
+
+    return f"""🔒 <b>Solana TVL (DeFiLlama)</b>
+
+<b>Total Value Locked:</b> ${tvl/1e9:.2f}B
+
+{trend_emoji} <b>24h Change:</b> {change_1d:+.1f}%
+<b>7d Change:</b> {change_7d:+.1f}%
+
+<b>Signal:</b> {signal_emoji} {signal}
+<i>{msg}</i>"""
+
+
+def get_gainers_status() -> str:
+    """Get formatted top gainers/losers for Telegram"""
+    data = fetch_top_gainers()
+
+    if not data:
+        return "Could not fetch market data."
+
+    lines = ["🏆 <b>Top Gainers (24h)</b>\n"]
+
+    for coin in data["gainers"]:
+        lines.append(f"🟢 <b>{coin['symbol']}</b> +{coin['change_24h']:.1f}% (${coin['price']:,.2f})")
+
+    lines.append("\n📉 <b>Top Losers (24h)</b>\n")
+
+    for coin in data["losers"]:
+        lines.append(f"🔴 <b>{coin['symbol']}</b> {coin['change_24h']:.1f}% (${coin['price']:,.2f})")
+
+    lines.append("\n<i>Top 100 by market cap</i>")
+
+    return "\n".join(lines)
+
+
+def update_tvl_data():
+    """Update TVL data for AI context"""
+    data = fetch_solana_tvl()
+    if not data:
+        return
+
+    change_1d = data.get("change_1d", 0) or 0
+    tvl = data.get("tvl", 0)
+
+    if change_1d > 3:
+        signal = "BULLISH"
+        message = f"Solana TVL up {change_1d:.1f}% - money flowing in (${tvl/1e9:.1f}B)"
+    elif change_1d < -3:
+        signal = "BEARISH"
+        message = f"Solana TVL down {abs(change_1d):.1f}% - money flowing out (${tvl/1e9:.1f}B)"
+    else:
+        signal = "NEUTRAL"
+        message = f"Solana TVL stable at ${tvl/1e9:.1f}B"
+
+    AGENT_DATA["tvl"]["signal"] = signal
+    AGENT_DATA["tvl"]["message"] = message
+    AGENT_DATA["tvl"]["updated"] = datetime.now()
+
+    print(f"TVL update: {signal} - {message}")
+
+
+def update_dominance_data():
+    """Update BTC dominance data for AI context"""
+    data = fetch_btc_dominance()
+    if not data:
+        return
+
+    btc_dom = data.get("btc_dominance", 50)
+
+    if btc_dom < 40:
+        signal = "BULLISH"  # Alt season = good for SOL
+        message = f"Alt season - BTC dominance low ({btc_dom:.1f}%)"
+    elif btc_dom > 55:
+        signal = "BEARISH"  # BTC season = bad for alts
+        message = f"BTC season - dominance high ({btc_dom:.1f}%), alts underperforming"
+    else:
+        signal = "NEUTRAL"
+        message = f"BTC dominance balanced at {btc_dom:.1f}%"
+
+    AGENT_DATA["dominance"]["signal"] = signal
+    AGENT_DATA["dominance"]["message"] = message
+    AGENT_DATA["dominance"]["updated"] = datetime.now()
+
+    print(f"Dominance update: {signal} - {message}")
 
 
 # ============================================================================
@@ -967,11 +1278,14 @@ Send /auto to enable AI trading""")
 /sell [amount] [token] - Sell token
 
 <b>Info:</b>
-/status - Bot status + wallet
-/price [token] - Get price
-/analyze - Run AI analysis now
-/sentiment - Fear & Greed Index
-/market - SOL market data
+/status - Wallet + bot status
+/analyze - AI analysis now
+/sentiment - Fear & Greed
+/market - SOL price data
+/trending - Hot coins
+/btc - BTC dominance
+/tvl - Solana DeFi TVL
+/gainers - Top gainers/losers
 
 <b>Controls:</b>
 /pause - Pause all trading
@@ -1161,6 +1475,22 @@ Reply /cancel to skip"""
             send_telegram("<b>Fetching SOL market data...</b>")
             update_volume_data()
             send_telegram(get_market_status())
+
+        elif cmd == "/trending" or cmd == "/hot":
+            send_telegram("<b>Fetching trending coins...</b>")
+            send_telegram(get_trending_status())
+
+        elif cmd == "/btc" or cmd == "/dominance":
+            send_telegram("<b>Fetching BTC dominance...</b>")
+            send_telegram(get_btc_dominance_status())
+
+        elif cmd == "/tvl" or cmd == "/defi":
+            send_telegram("<b>Fetching Solana TVL...</b>")
+            send_telegram(get_tvl_status())
+
+        elif cmd == "/gainers" or cmd == "/losers" or cmd == "/movers":
+            send_telegram("<b>Fetching top movers...</b>")
+            send_telegram(get_gainers_status())
 
         elif cmd.startswith("/buy") or cmd.startswith("buy "):
             # Parse various formats:
@@ -1371,6 +1701,11 @@ Fear & Greed: {new_sentiment}/100
 SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
 
 <i>Check /market for details</i>""")
+
+            # Update TVL and dominance data (for AI context)
+            print("Updating TVL and dominance...")
+            update_tvl_data()
+            update_dominance_data()
 
             symbol = self.active_token
             token_address = TOKENS.get(symbol, SOL_ADDRESS)
