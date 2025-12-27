@@ -35,6 +35,12 @@ OPENAI_KEY = os.getenv("OPENAI_KEY", "")
 SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
 RPC_ENDPOINT = os.getenv("RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")
+
+# Alert Thresholds
+FEAR_GREED_EXTREME_LOW = 25   # Below this = extreme fear (buy signal)
+FEAR_GREED_EXTREME_HIGH = 75  # Above this = extreme greed (sell signal)
+PRICE_ALERT_THRESHOLD = 7     # % change to trigger big move alert
 
 # Token Addresses
 USDC_ADDRESS = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -51,7 +57,1125 @@ DEFAULT_TOKEN = "SOL"
 TRADE_SIZE_USD = 10  # Default trade size in USD
 SLIPPAGE_BPS = 500  # 5% slippage
 CHECK_INTERVAL_MINUTES = 15
-MIN_CONFIDENCE = 60
+MIN_CONFIDENCE = 70  # Minimum confidence for auto-trading
+
+# Autonomous Trading Settings
+AUTO_TRADE_AMOUNT = 0.01  # Amount to trade in token units when auto mode is on
+AUTO_CONFIRM_TIMEOUT = 60  # Seconds to wait for user confirmation (0 = no confirmation needed)
+AUTO_MAX_DAILY_TRADES = 5  # Max trades per day in auto mode
+
+# External Agent Data (will be populated by agent feeds)
+AGENT_DATA = {
+    "sentiment": {"signal": None, "message": "", "updated": None},
+    "volume": {"signal": None, "message": "", "updated": None},
+    "tvl": {"signal": None, "message": "", "updated": None},
+    "dominance": {"signal": None, "message": "", "updated": None},
+    "dex_volume": {"signal": None, "message": "", "updated": None},
+    "yields": {"signal": None, "message": "", "updated": None},
+    "stablecoins": {"signal": None, "message": "", "updated": None},
+    "whales": {"signal": None, "message": "", "updated": None},
+}
+
+# ============================================================================
+# FREE DATA FEEDS (No API keys required)
+# ============================================================================
+
+def fetch_fear_greed() -> dict:
+    """Fetch Fear & Greed Index from alternative.me (FREE, no API key)"""
+    try:
+        url = "https://api.alternative.me/fng/?limit=1"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"Fear & Greed API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        if data.get("data"):
+            fng = data["data"][0]
+            return {
+                "value": int(fng.get("value", 50)),
+                "classification": fng.get("value_classification", "Neutral"),
+                "timestamp": datetime.now()
+            }
+        return None
+
+    except Exception as e:
+        print(f"Error fetching Fear & Greed: {e}")
+        return None
+
+
+def fetch_sol_market_data() -> dict:
+    """Fetch SOL market data from CoinGecko (FREE, no API key)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/solana"
+        params = {
+            "localization": "false",
+            "tickers": "false",
+            "community_data": "false",
+            "developer_data": "false"
+        }
+        response = requests.get(url, params=params, timeout=10)
+
+        if response.status_code != 200:
+            print(f"CoinGecko API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        market = data.get("market_data", {})
+
+        return {
+            "price": market.get("current_price", {}).get("usd", 0),
+            "price_change_24h": market.get("price_change_percentage_24h", 0),
+            "price_change_7d": market.get("price_change_percentage_7d", 0),
+            "volume_24h": market.get("total_volume", {}).get("usd", 0),
+            "volume_change_24h": market.get("volume_change_24h", 0) if "volume_change_24h" in market else 0,
+            "market_cap": market.get("market_cap", {}).get("usd", 0),
+            "ath": market.get("ath", {}).get("usd", 0),
+            "ath_change": market.get("ath_change_percentage", {}).get("usd", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching SOL market data: {e}")
+        return None
+
+
+def update_sentiment_data():
+    """Update sentiment from Fear & Greed Index"""
+    fng = fetch_fear_greed()
+    if not fng:
+        return
+
+    value = fng["value"]
+    classification = fng["classification"]
+
+    # Determine signal based on Fear & Greed
+    # Extreme Fear (<25) = potential buy opportunity
+    # Extreme Greed (>75) = potential sell signal
+    if value <= 25:
+        signal = "BULLISH"  # Extreme fear = buy opportunity
+        message = f"Extreme Fear ({value}/100) - Potential buy opportunity"
+    elif value <= 40:
+        signal = "NEUTRAL"
+        message = f"Fear ({value}/100) - Market cautious"
+    elif value <= 60:
+        signal = "NEUTRAL"
+        message = f"Neutral ({value}/100) - Market indecisive"
+    elif value <= 75:
+        signal = "NEUTRAL"
+        message = f"Greed ({value}/100) - Market confident"
+    else:
+        signal = "BEARISH"  # Extreme greed = potential top
+        message = f"Extreme Greed ({value}/100) - Potential correction ahead"
+
+    AGENT_DATA["sentiment"]["signal"] = signal
+    AGENT_DATA["sentiment"]["message"] = message
+    AGENT_DATA["sentiment"]["updated"] = datetime.now()
+    AGENT_DATA["sentiment"]["value"] = value
+    AGENT_DATA["sentiment"]["classification"] = classification
+
+    print(f"Sentiment update: {signal} - {message}")
+
+
+def update_volume_data():
+    """Update volume/market data for SOL"""
+    market = fetch_sol_market_data()
+    if not market:
+        return
+
+    price_change = market["price_change_24h"]
+    volume = market["volume_24h"]
+
+    # Determine signal based on price momentum and volume
+    if price_change > 5:
+        signal = "BULLISH"
+        message = f"SOL up {price_change:.1f}% (24h), Vol: ${volume/1e9:.2f}B"
+    elif price_change > 2:
+        signal = "NEUTRAL"
+        message = f"SOL up {price_change:.1f}% (24h), moderate momentum"
+    elif price_change < -5:
+        signal = "BEARISH"
+        message = f"SOL down {abs(price_change):.1f}% (24h), Vol: ${volume/1e9:.2f}B"
+    elif price_change < -2:
+        signal = "NEUTRAL"
+        message = f"SOL down {abs(price_change):.1f}% (24h), minor pullback"
+    else:
+        signal = "NEUTRAL"
+        message = f"SOL flat ({price_change:+.1f}%), consolidating"
+
+    AGENT_DATA["volume"]["signal"] = signal
+    AGENT_DATA["volume"]["message"] = message
+    AGENT_DATA["volume"]["updated"] = datetime.now()
+    AGENT_DATA["volume"]["price_change"] = price_change
+    AGENT_DATA["volume"]["volume_24h"] = volume
+    AGENT_DATA["volume"]["market_data"] = market
+
+    print(f"Volume update: {signal} - {message}")
+
+
+def get_sentiment_status() -> str:
+    """Get formatted sentiment status for Telegram"""
+    data = AGENT_DATA.get("sentiment", {})
+
+    if not data.get("updated"):
+        return "No sentiment data available yet."
+
+    age = datetime.now() - data["updated"]
+    age_mins = age.total_seconds() / 60
+
+    value = data.get("value", 50)
+    classification = data.get("classification", "Neutral")
+    signal = data.get("signal", "NEUTRAL")
+
+    # Fear & Greed emoji scale
+    if value <= 25:
+        emoji = "😱"
+    elif value <= 40:
+        emoji = "😰"
+    elif value <= 60:
+        emoji = "😐"
+    elif value <= 75:
+        emoji = "😊"
+    else:
+        emoji = "🤑"
+
+    signal_emoji = "🟢" if signal == "BULLISH" else "🔴" if signal == "BEARISH" else "⚪"
+
+    return f"""{emoji} <b>Market Sentiment</b>
+
+<b>Fear & Greed:</b> {value}/100 ({classification})
+<b>Signal:</b> {signal_emoji} {signal}
+<b>Updated:</b> {age_mins:.0f} min ago
+
+<i>{'Buy opportunity - others are fearful' if value <= 25 else 'Caution - market may be overheated' if value >= 75 else 'Normal market conditions'}</i>"""
+
+
+def get_market_status() -> str:
+    """Get formatted market status for Telegram"""
+    data = AGENT_DATA.get("volume", {})
+
+    if not data.get("updated"):
+        return "No market data available yet."
+
+    age = datetime.now() - data["updated"]
+    age_mins = age.total_seconds() / 60
+
+    market = data.get("market_data", {})
+    price = market.get("price", 0)
+    change_24h = market.get("price_change_24h", 0)
+    change_7d = market.get("price_change_7d", 0)
+    volume = market.get("volume_24h", 0)
+    ath = market.get("ath", 0)
+    ath_change = market.get("ath_change", 0)
+
+    trend_emoji = "📈" if change_24h > 0 else "📉"
+
+    return f"""{trend_emoji} <b>SOL Market Data</b>
+
+<b>Price:</b> ${price:,.2f}
+<b>24h Change:</b> {change_24h:+.2f}%
+<b>7d Change:</b> {change_7d:+.2f}%
+<b>24h Volume:</b> ${volume/1e9:.2f}B
+<b>ATH:</b> ${ath:,.2f} ({ath_change:.1f}%)
+
+<b>Updated:</b> {age_mins:.0f} min ago"""
+
+
+def fetch_trending_coins() -> list:
+    """Fetch trending coins from CoinGecko (FREE)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/search/trending"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"CoinGecko trending API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        coins = data.get("coins", [])
+
+        trending = []
+        for coin in coins[:7]:  # Top 7
+            item = coin.get("item", {})
+            trending.append({
+                "name": item.get("name", "Unknown"),
+                "symbol": item.get("symbol", "???").upper(),
+                "rank": item.get("market_cap_rank", 0),
+                "price_btc": item.get("price_btc", 0),
+                "score": item.get("score", 0) + 1  # 0-indexed
+            })
+
+        return trending
+
+    except Exception as e:
+        print(f"Error fetching trending: {e}")
+        return None
+
+
+def fetch_btc_dominance() -> dict:
+    """Fetch BTC dominance and global market data from CoinGecko (FREE)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/global"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"CoinGecko global API error: {response.status_code}")
+            return None
+
+        data = response.json().get("data", {})
+
+        return {
+            "btc_dominance": data.get("market_cap_percentage", {}).get("btc", 0),
+            "eth_dominance": data.get("market_cap_percentage", {}).get("eth", 0),
+            "total_market_cap": data.get("total_market_cap", {}).get("usd", 0),
+            "total_volume": data.get("total_volume", {}).get("usd", 0),
+            "market_cap_change_24h": data.get("market_cap_change_percentage_24h_usd", 0),
+            "active_cryptocurrencies": data.get("active_cryptocurrencies", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching BTC dominance: {e}")
+        return None
+
+
+def fetch_solana_tvl() -> dict:
+    """Fetch Solana TVL from DeFiLlama (FREE)"""
+    try:
+        url = "https://api.llama.fi/v2/chains"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            print(f"DeFiLlama API error: {response.status_code}")
+            return None
+
+        chains = response.json()
+
+        # Find Solana
+        solana = None
+        for chain in chains:
+            if chain.get("name", "").lower() == "solana":
+                solana = chain
+                break
+
+        if not solana:
+            return None
+
+        return {
+            "tvl": solana.get("tvl", 0),
+            "change_1d": solana.get("change_1d", 0),
+            "change_7d": solana.get("change_7d", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching Solana TVL: {e}")
+        return None
+
+
+def fetch_top_gainers() -> dict:
+    """Fetch top gainers and losers from CoinGecko (FREE)"""
+    try:
+        # Get top coins by market cap with price changes
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": 100,
+            "page": 1,
+            "sparkline": "false",
+            "price_change_percentage": "24h"
+        }
+        response = requests.get(url, params=params, timeout=15)
+
+        if response.status_code != 200:
+            print(f"CoinGecko markets API error: {response.status_code}")
+            return None
+
+        coins = response.json()
+
+        # Sort by 24h change
+        sorted_coins = sorted(coins, key=lambda x: x.get("price_change_percentage_24h") or 0, reverse=True)
+
+        gainers = []
+        for coin in sorted_coins[:5]:
+            gainers.append({
+                "name": coin.get("name", "Unknown"),
+                "symbol": coin.get("symbol", "???").upper(),
+                "price": coin.get("current_price", 0),
+                "change_24h": coin.get("price_change_percentage_24h", 0)
+            })
+
+        losers = []
+        for coin in sorted_coins[-5:]:
+            losers.append({
+                "name": coin.get("name", "Unknown"),
+                "symbol": coin.get("symbol", "???").upper(),
+                "price": coin.get("current_price", 0),
+                "change_24h": coin.get("price_change_percentage_24h", 0)
+            })
+
+        return {
+            "gainers": gainers,
+            "losers": list(reversed(losers)),  # Worst first
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching top gainers: {e}")
+        return None
+
+
+def get_trending_status() -> str:
+    """Get formatted trending coins for Telegram"""
+    trending = fetch_trending_coins()
+
+    if not trending:
+        return "Could not fetch trending coins."
+
+    lines = ["🔥 <b>Trending Coins</b>\n"]
+
+    for i, coin in enumerate(trending):
+        rank = coin.get("rank", "?")
+        rank_str = f"#{rank}" if rank else ""
+        lines.append(f"{i+1}. <b>{coin['symbol']}</b> - {coin['name']} {rank_str}")
+
+    lines.append("\n<i>Source: CoinGecko</i>")
+
+    return "\n".join(lines)
+
+
+def get_btc_dominance_status() -> str:
+    """Get formatted BTC dominance for Telegram"""
+    data = fetch_btc_dominance()
+
+    if not data:
+        return "Could not fetch market data."
+
+    btc_dom = data["btc_dominance"]
+    eth_dom = data["eth_dominance"]
+    total_cap = data["total_market_cap"]
+    cap_change = data["market_cap_change_24h"]
+
+    # Determine alt season signal
+    if btc_dom < 40:
+        signal = "🚀 ALT SEASON"
+        signal_msg = "BTC dominance low - alts outperforming"
+    elif btc_dom > 55:
+        signal = "🔶 BTC SEASON"
+        signal_msg = "BTC dominance high - alts underperforming"
+    else:
+        signal = "⚖️ BALANCED"
+        signal_msg = "Market in equilibrium"
+
+    trend_emoji = "📈" if cap_change > 0 else "📉"
+
+    return f"""₿ <b>Market Dominance</b>
+
+<b>BTC:</b> {btc_dom:.1f}%
+<b>ETH:</b> {eth_dom:.1f}%
+<b>Others:</b> {100 - btc_dom - eth_dom:.1f}%
+
+{trend_emoji} <b>Total Market Cap:</b> ${total_cap/1e12:.2f}T ({cap_change:+.1f}%)
+
+<b>Signal:</b> {signal}
+<i>{signal_msg}</i>"""
+
+
+def get_tvl_status() -> str:
+    """Get formatted Solana TVL for Telegram"""
+    data = fetch_solana_tvl()
+
+    if not data:
+        return "Could not fetch TVL data."
+
+    tvl = data["tvl"]
+    change_1d = data.get("change_1d", 0) or 0
+    change_7d = data.get("change_7d", 0) or 0
+
+    # Determine signal
+    if change_1d > 3:
+        signal = "BULLISH"
+        signal_emoji = "🟢"
+        msg = "Money flowing into Solana DeFi"
+    elif change_1d < -3:
+        signal = "BEARISH"
+        signal_emoji = "🔴"
+        msg = "Money leaving Solana DeFi"
+    else:
+        signal = "NEUTRAL"
+        signal_emoji = "⚪"
+        msg = "Stable TVL"
+
+    trend_emoji = "📈" if change_1d > 0 else "📉"
+
+    return f"""🔒 <b>Solana TVL (DeFiLlama)</b>
+
+<b>Total Value Locked:</b> ${tvl/1e9:.2f}B
+
+{trend_emoji} <b>24h Change:</b> {change_1d:+.1f}%
+<b>7d Change:</b> {change_7d:+.1f}%
+
+<b>Signal:</b> {signal_emoji} {signal}
+<i>{msg}</i>"""
+
+
+def get_gainers_status() -> str:
+    """Get formatted top gainers/losers for Telegram"""
+    data = fetch_top_gainers()
+
+    if not data:
+        return "Could not fetch market data."
+
+    lines = ["🏆 <b>Top Gainers (24h)</b>\n"]
+
+    for coin in data["gainers"]:
+        lines.append(f"🟢 <b>{coin['symbol']}</b> +{coin['change_24h']:.1f}% (${coin['price']:,.2f})")
+
+    lines.append("\n📉 <b>Top Losers (24h)</b>\n")
+
+    for coin in data["losers"]:
+        lines.append(f"🔴 <b>{coin['symbol']}</b> {coin['change_24h']:.1f}% (${coin['price']:,.2f})")
+
+    lines.append("\n<i>Top 100 by market cap</i>")
+
+    return "\n".join(lines)
+
+
+def update_tvl_data():
+    """Update TVL data for AI context"""
+    data = fetch_solana_tvl()
+    if not data:
+        return
+
+    change_1d = data.get("change_1d", 0) or 0
+    tvl = data.get("tvl", 0)
+
+    if change_1d > 3:
+        signal = "BULLISH"
+        message = f"Solana TVL up {change_1d:.1f}% - money flowing in (${tvl/1e9:.1f}B)"
+    elif change_1d < -3:
+        signal = "BEARISH"
+        message = f"Solana TVL down {abs(change_1d):.1f}% - money flowing out (${tvl/1e9:.1f}B)"
+    else:
+        signal = "NEUTRAL"
+        message = f"Solana TVL stable at ${tvl/1e9:.1f}B"
+
+    AGENT_DATA["tvl"]["signal"] = signal
+    AGENT_DATA["tvl"]["message"] = message
+    AGENT_DATA["tvl"]["updated"] = datetime.now()
+
+    print(f"TVL update: {signal} - {message}")
+
+
+def update_dominance_data():
+    """Update BTC dominance data for AI context"""
+    data = fetch_btc_dominance()
+    if not data:
+        return
+
+    btc_dom = data.get("btc_dominance", 50)
+
+    if btc_dom < 40:
+        signal = "BULLISH"  # Alt season = good for SOL
+        message = f"Alt season - BTC dominance low ({btc_dom:.1f}%)"
+    elif btc_dom > 55:
+        signal = "BEARISH"  # BTC season = bad for alts
+        message = f"BTC season - dominance high ({btc_dom:.1f}%), alts underperforming"
+    else:
+        signal = "NEUTRAL"
+        message = f"BTC dominance balanced at {btc_dom:.1f}%"
+
+    AGENT_DATA["dominance"]["signal"] = signal
+    AGENT_DATA["dominance"]["message"] = message
+    AGENT_DATA["dominance"]["updated"] = datetime.now()
+
+    print(f"Dominance update: {signal} - {message}")
+
+
+# ============================================================================
+# DEFILLAMA DATA FEEDS (Free, no API key)
+# ============================================================================
+
+def fetch_dex_volume() -> dict:
+    """Fetch Solana DEX trading volume from DeFiLlama (FREE)"""
+    try:
+        url = "https://api.llama.fi/overview/dexs/solana"
+        response = requests.get(url, timeout=15)
+
+        if response.status_code != 200:
+            print(f"DeFiLlama DEX API error: {response.status_code}")
+            return None
+
+        data = response.json()
+
+        # Get total 24h volume and change
+        total_24h = data.get("total24h", 0)
+        total_48h_to_24h = data.get("total48hto24h", 0)
+        change_1d = data.get("change_1d", 0)
+
+        # Get top DEXes
+        protocols = data.get("protocols", [])
+        top_dexes = []
+        for p in sorted(protocols, key=lambda x: x.get("total24h", 0) or 0, reverse=True)[:5]:
+            top_dexes.append({
+                "name": p.get("name", "Unknown"),
+                "volume_24h": p.get("total24h", 0),
+                "change_1d": p.get("change_1d", 0)
+            })
+
+        return {
+            "total_24h": total_24h,
+            "change_1d": change_1d,
+            "top_dexes": top_dexes,
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching DEX volume: {e}")
+        return None
+
+
+def fetch_defi_yields() -> list:
+    """Fetch best Solana DeFi yields from DeFiLlama (FREE)"""
+    try:
+        url = "https://yields.llama.fi/pools"
+        response = requests.get(url, timeout=15)
+
+        if response.status_code != 200:
+            print(f"DeFiLlama Yields API error: {response.status_code}")
+            return None
+
+        data = response.json()
+        pools = data.get("data", [])
+
+        # Filter for Solana pools with good APY
+        solana_pools = [p for p in pools if p.get("chain", "").lower() == "solana" and p.get("apy", 0) > 1]
+
+        # Sort by APY
+        solana_pools.sort(key=lambda x: x.get("apy", 0), reverse=True)
+
+        top_yields = []
+        for p in solana_pools[:10]:
+            top_yields.append({
+                "pool": p.get("symbol", "Unknown"),
+                "project": p.get("project", "Unknown"),
+                "apy": p.get("apy", 0),
+                "tvl": p.get("tvlUsd", 0),
+                "apy_base": p.get("apyBase", 0),
+                "apy_reward": p.get("apyReward", 0)
+            })
+
+        return top_yields
+
+    except Exception as e:
+        print(f"Error fetching yields: {e}")
+        return None
+
+
+def fetch_stablecoin_flows() -> dict:
+    """Fetch Solana stablecoin flows from DeFiLlama (FREE)"""
+    try:
+        url = "https://stablecoins.llama.fi/stablecoincharts/solana"
+        response = requests.get(url, timeout=15)
+
+        if response.status_code != 200:
+            print(f"DeFiLlama Stablecoins API error: {response.status_code}")
+            return None
+
+        data = response.json()
+
+        if not data or len(data) < 2:
+            return None
+
+        # Get latest and previous data points
+        latest = data[-1]
+        previous = data[-2] if len(data) > 1 else latest
+        week_ago = data[-7] if len(data) > 7 else data[0]
+
+        # Calculate total stablecoins
+        total_now = sum(v.get("circulating", {}).get("peggedUSD", 0) for v in [latest])
+        total_prev = sum(v.get("circulating", {}).get("peggedUSD", 0) for v in [previous])
+        total_week = sum(v.get("circulating", {}).get("peggedUSD", 0) for v in [week_ago])
+
+        # Get individual stablecoin amounts
+        stables = latest.get("totalCirculating", {}).get("peggedUSD", 0)
+
+        change_1d = ((total_now - total_prev) / total_prev * 100) if total_prev > 0 else 0
+        change_7d = ((total_now - total_week) / total_week * 100) if total_week > 0 else 0
+
+        return {
+            "total_usd": stables,
+            "change_1d": change_1d,
+            "change_7d": change_7d,
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching stablecoin flows: {e}")
+        return None
+
+
+def fetch_exchange_volumes() -> list:
+    """Fetch top exchange volumes from CoinGecko (FREE)"""
+    try:
+        url = "https://api.coingecko.com/api/v3/exchanges"
+        params = {"per_page": 10}
+        response = requests.get(url, params=params, timeout=15)
+
+        if response.status_code != 200:
+            print(f"CoinGecko Exchanges API error: {response.status_code}")
+            return None
+
+        exchanges = response.json()
+
+        result = []
+        for ex in exchanges[:10]:
+            result.append({
+                "name": ex.get("name", "Unknown"),
+                "volume_24h_btc": ex.get("trade_volume_24h_btc", 0),
+                "trust_score": ex.get("trust_score", 0),
+                "year_established": ex.get("year_established")
+            })
+
+        return result
+
+    except Exception as e:
+        print(f"Error fetching exchange volumes: {e}")
+        return None
+
+
+# ============================================================================
+# BIRDEYE DATA FEEDS (Requires API key)
+# ============================================================================
+
+def fetch_birdeye_token_overview(token_address: str) -> dict:
+    """Fetch detailed token data from Birdeye"""
+    if not BIRDEYE_API_KEY:
+        return None
+
+    try:
+        url = f"https://public-api.birdeye.so/defi/token_overview?address={token_address}"
+        headers = {"X-API-KEY": BIRDEYE_API_KEY}
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            print(f"Birdeye token overview error: {response.status_code}")
+            return None
+
+        data = response.json()
+        if not data.get("success"):
+            return None
+
+        token = data.get("data", {})
+        return {
+            "price": token.get("price", 0),
+            "price_change_24h": token.get("priceChange24hPercent", 0),
+            "volume_24h": token.get("v24hUSD", 0),
+            "volume_change_24h": token.get("v24hChangePercent", 0),
+            "liquidity": token.get("liquidity", 0),
+            "mc": token.get("mc", 0),
+            "holder": token.get("holder", 0),
+            "trade_24h": token.get("trade24h", 0),
+            "buy_24h": token.get("buy24h", 0),
+            "sell_24h": token.get("sell24h", 0),
+            "timestamp": datetime.now()
+        }
+
+    except Exception as e:
+        print(f"Error fetching Birdeye overview: {e}")
+        return None
+
+
+def fetch_birdeye_trades(token_address: str, limit: int = 20) -> list:
+    """Fetch recent trades from Birdeye"""
+    if not BIRDEYE_API_KEY:
+        return None
+
+    try:
+        url = f"https://public-api.birdeye.so/defi/txs/token?address={token_address}&tx_type=swap&limit={limit}"
+        headers = {"X-API-KEY": BIRDEYE_API_KEY}
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        if not data.get("success"):
+            return None
+
+        trades = data.get("data", {}).get("items", [])
+        return trades
+
+    except Exception as e:
+        print(f"Error fetching Birdeye trades: {e}")
+        return None
+
+
+# ============================================================================
+# HELIUS DATA FEEDS (Requires API key)
+# ============================================================================
+
+def fetch_helius_whale_transactions(min_sol: float = 100) -> list:
+    """Fetch large SOL transactions from Helius"""
+    if not HELIUS_API_KEY:
+        return None
+
+    try:
+        # Get recent signatures for SOL transfers
+        url = f"https://api.helius.xyz/v0/addresses/{SOL_ADDRESS}/transactions?api-key={HELIUS_API_KEY}&limit=50"
+        response = requests.get(url, timeout=15)
+
+        if response.status_code != 200:
+            print(f"Helius API error: {response.status_code}")
+            return None
+
+        transactions = response.json()
+
+        # Filter for large transfers
+        whales = []
+        for tx in transactions:
+            # Look for native transfers
+            native_transfers = tx.get("nativeTransfers", [])
+            for transfer in native_transfers:
+                amount_sol = transfer.get("amount", 0) / 1_000_000_000
+                if amount_sol >= min_sol:
+                    whales.append({
+                        "signature": tx.get("signature", "")[:16] + "...",
+                        "amount_sol": amount_sol,
+                        "from": transfer.get("fromUserAccount", "")[:8] + "...",
+                        "to": transfer.get("toUserAccount", "")[:8] + "...",
+                        "timestamp": tx.get("timestamp", 0)
+                    })
+
+        return whales[:10]  # Top 10 whale moves
+
+    except Exception as e:
+        print(f"Error fetching Helius whale data: {e}")
+        return None
+
+
+def fetch_helius_token_holders(token_address: str) -> dict:
+    """Fetch token holder distribution from Helius"""
+    if not HELIUS_API_KEY:
+        return None
+
+    try:
+        url = f"https://api.helius.xyz/v0/token-metadata?api-key={HELIUS_API_KEY}"
+        payload = {"mintAccounts": [token_address]}
+        response = requests.post(url, json=payload, timeout=10)
+
+        if response.status_code != 200:
+            return None
+
+        data = response.json()
+        if data and len(data) > 0:
+            token = data[0]
+            return {
+                "name": token.get("onChainAccountInfo", {}).get("metadata", {}).get("name", "Unknown"),
+                "symbol": token.get("onChainAccountInfo", {}).get("metadata", {}).get("symbol", "???"),
+                "supply": token.get("onChainAccountInfo", {}).get("tokenAmount", {}).get("uiAmount", 0)
+            }
+        return None
+
+    except Exception as e:
+        print(f"Error fetching Helius holders: {e}")
+        return None
+
+
+# ============================================================================
+# UPDATE FUNCTIONS FOR NEW FEEDS
+# ============================================================================
+
+def update_dex_volume_data():
+    """Update DEX volume data for AI context"""
+    data = fetch_dex_volume()
+    if not data:
+        return
+
+    volume = data.get("total_24h", 0)
+    change = data.get("change_1d", 0)
+
+    if change > 20:
+        signal = "BULLISH"
+        message = f"Solana DEX volume surging +{change:.0f}% (${volume/1e9:.2f}B)"
+    elif change > 5:
+        signal = "NEUTRAL"
+        message = f"Solana DEX volume up {change:.0f}% (${volume/1e9:.2f}B)"
+    elif change < -20:
+        signal = "BEARISH"
+        message = f"Solana DEX volume dropping {change:.0f}% (${volume/1e9:.2f}B)"
+    else:
+        signal = "NEUTRAL"
+        message = f"Solana DEX volume: ${volume/1e9:.2f}B ({change:+.0f}%)"
+
+    AGENT_DATA["dex_volume"]["signal"] = signal
+    AGENT_DATA["dex_volume"]["message"] = message
+    AGENT_DATA["dex_volume"]["updated"] = datetime.now()
+    AGENT_DATA["dex_volume"]["data"] = data
+
+    print(f"DEX Volume update: {signal} - {message}")
+
+
+def update_yields_data():
+    """Update yields data for AI context"""
+    yields = fetch_defi_yields()
+    if not yields:
+        return
+
+    # Get average APY of top yields
+    avg_apy = sum(y.get("apy", 0) for y in yields[:5]) / 5 if yields else 0
+    max_apy = max(y.get("apy", 0) for y in yields) if yields else 0
+
+    if avg_apy > 20:
+        signal = "BULLISH"
+        message = f"High DeFi yields on Solana - avg {avg_apy:.1f}% APY"
+    elif avg_apy > 10:
+        signal = "NEUTRAL"
+        message = f"Moderate DeFi yields - avg {avg_apy:.1f}% APY"
+    else:
+        signal = "NEUTRAL"
+        message = f"Low DeFi yields - avg {avg_apy:.1f}% APY"
+
+    AGENT_DATA["yields"]["signal"] = signal
+    AGENT_DATA["yields"]["message"] = message
+    AGENT_DATA["yields"]["updated"] = datetime.now()
+    AGENT_DATA["yields"]["data"] = yields
+
+    print(f"Yields update: {signal} - {message}")
+
+
+def update_stablecoin_data():
+    """Update stablecoin flow data for AI context"""
+    data = fetch_stablecoin_flows()
+    if not data:
+        return
+
+    total = data.get("total_usd", 0)
+    change_1d = data.get("change_1d", 0)
+    change_7d = data.get("change_7d", 0)
+
+    if change_1d > 2:
+        signal = "BULLISH"
+        message = f"Stablecoins flowing into Solana +{change_1d:.1f}% (${total/1e9:.2f}B)"
+    elif change_1d < -2:
+        signal = "BEARISH"
+        message = f"Stablecoins leaving Solana {change_1d:.1f}% (${total/1e9:.2f}B)"
+    else:
+        signal = "NEUTRAL"
+        message = f"Stablecoin supply stable at ${total/1e9:.2f}B"
+
+    AGENT_DATA["stablecoins"]["signal"] = signal
+    AGENT_DATA["stablecoins"]["message"] = message
+    AGENT_DATA["stablecoins"]["updated"] = datetime.now()
+    AGENT_DATA["stablecoins"]["data"] = data
+
+    print(f"Stablecoin update: {signal} - {message}")
+
+
+def update_whale_data():
+    """Update whale transaction data for AI context"""
+    if not HELIUS_API_KEY:
+        return
+
+    whales = fetch_helius_whale_transactions(min_sol=500)
+    if not whales:
+        return
+
+    total_volume = sum(w.get("amount_sol", 0) for w in whales)
+    count = len(whales)
+
+    if count >= 5 and total_volume > 5000:
+        signal = "BULLISH" if total_volume > 10000 else "NEUTRAL"
+        message = f"Whale activity: {count} large txs ({total_volume:.0f} SOL moved)"
+    else:
+        signal = "NEUTRAL"
+        message = f"Low whale activity: {count} large txs"
+
+    AGENT_DATA["whales"]["signal"] = signal
+    AGENT_DATA["whales"]["message"] = message
+    AGENT_DATA["whales"]["updated"] = datetime.now()
+    AGENT_DATA["whales"]["data"] = whales
+
+    print(f"Whale update: {signal} - {message}")
+
+
+# ============================================================================
+# STATUS FUNCTIONS FOR NEW FEEDS
+# ============================================================================
+
+def get_dex_volume_status() -> str:
+    """Get formatted DEX volume for Telegram"""
+    data = fetch_dex_volume()
+
+    if not data:
+        return "Could not fetch DEX volume data."
+
+    volume = data.get("total_24h", 0)
+    change = data.get("change_1d", 0)
+    top_dexes = data.get("top_dexes", [])
+
+    trend_emoji = "📈" if change > 0 else "📉"
+
+    lines = [f"""{trend_emoji} <b>Solana DEX Volume (24h)</b>
+
+<b>Total Volume:</b> ${volume/1e9:.2f}B
+<b>24h Change:</b> {change:+.1f}%
+
+<b>Top DEXes:</b>"""]
+
+    for dex in top_dexes:
+        dex_vol = dex.get("volume_24h", 0)
+        dex_change = dex.get("change_1d", 0)
+        lines.append(f"• {dex['name']}: ${dex_vol/1e6:.1f}M ({dex_change:+.0f}%)")
+
+    lines.append("\n<i>Source: DeFiLlama</i>")
+    return "\n".join(lines)
+
+
+def get_yields_status() -> str:
+    """Get formatted DeFi yields for Telegram"""
+    yields = fetch_defi_yields()
+
+    if not yields:
+        return "Could not fetch yield data."
+
+    lines = ["🌾 <b>Top Solana DeFi Yields</b>\n"]
+
+    for y in yields[:7]:
+        pool = y.get("pool", "Unknown")
+        project = y.get("project", "Unknown")
+        apy = y.get("apy", 0)
+        tvl = y.get("tvl", 0)
+
+        lines.append(f"• <b>{pool}</b> ({project})")
+        lines.append(f"  APY: {apy:.1f}% | TVL: ${tvl/1e6:.1f}M")
+
+    lines.append("\n<i>Source: DeFiLlama</i>")
+    return "\n".join(lines)
+
+
+def get_stablecoin_status() -> str:
+    """Get formatted stablecoin flows for Telegram"""
+    data = fetch_stablecoin_flows()
+
+    if not data:
+        return "Could not fetch stablecoin data."
+
+    total = data.get("total_usd", 0)
+    change_1d = data.get("change_1d", 0)
+    change_7d = data.get("change_7d", 0)
+
+    trend_emoji = "📈" if change_1d > 0 else "📉"
+
+    # Determine signal
+    if change_1d > 2:
+        signal = "🟢 INFLOWS"
+        msg = "Capital entering Solana ecosystem"
+    elif change_1d < -2:
+        signal = "🔴 OUTFLOWS"
+        msg = "Capital leaving Solana ecosystem"
+    else:
+        signal = "⚪ STABLE"
+        msg = "Stablecoin supply unchanged"
+
+    return f"""{trend_emoji} <b>Solana Stablecoin Flows</b>
+
+<b>Total Stablecoins:</b> ${total/1e9:.2f}B
+
+<b>24h Change:</b> {change_1d:+.2f}%
+<b>7d Change:</b> {change_7d:+.2f}%
+
+<b>Signal:</b> {signal}
+<i>{msg}</i>
+
+<i>Source: DeFiLlama</i>"""
+
+
+def get_exchange_status() -> str:
+    """Get formatted exchange volumes for Telegram"""
+    exchanges = fetch_exchange_volumes()
+
+    if not exchanges:
+        return "Could not fetch exchange data."
+
+    lines = ["🏦 <b>Top Crypto Exchanges (24h Volume)</b>\n"]
+
+    for i, ex in enumerate(exchanges[:10], 1):
+        name = ex.get("name", "Unknown")
+        vol = ex.get("volume_24h_btc", 0)
+        trust = ex.get("trust_score", 0)
+        trust_bar = "🟢" * min(trust, 10) if trust else "⚪"
+
+        lines.append(f"{i}. <b>{name}</b>")
+        lines.append(f"   Vol: {vol:,.0f} BTC | Trust: {trust_bar}")
+
+    lines.append("\n<i>Source: CoinGecko</i>")
+    return "\n".join(lines)
+
+
+def get_birdeye_status(token: str = "SOL") -> str:
+    """Get formatted Birdeye token data for Telegram"""
+    if not BIRDEYE_API_KEY:
+        return "Birdeye API key not configured.\n\nGet your free key at: birdeye.so"
+
+    token_address = TOKENS.get(token.upper(), SOL_ADDRESS)
+    data = fetch_birdeye_token_overview(token_address)
+
+    if not data:
+        return "Could not fetch Birdeye data."
+
+    price = data.get("price", 0)
+    change = data.get("price_change_24h", 0)
+    volume = data.get("volume_24h", 0)
+    liquidity = data.get("liquidity", 0)
+    trades = data.get("trade_24h", 0)
+    buys = data.get("buy_24h", 0)
+    sells = data.get("sell_24h", 0)
+
+    buy_ratio = (buys / (buys + sells) * 100) if (buys + sells) > 0 else 50
+    trend_emoji = "📈" if change > 0 else "📉"
+
+    return f"""{trend_emoji} <b>Birdeye: {token}</b>
+
+<b>Price:</b> ${price:,.4f} ({change:+.1f}%)
+<b>24h Volume:</b> ${volume/1e6:.2f}M
+<b>Liquidity:</b> ${liquidity/1e6:.2f}M
+
+<b>Trading Activity:</b>
+• Total Trades: {trades:,}
+• Buys: {buys:,} ({buy_ratio:.0f}%)
+• Sells: {sells:,} ({100-buy_ratio:.0f}%)
+
+<i>Source: Birdeye</i>"""
+
+
+def get_whale_status() -> str:
+    """Get formatted whale activity for Telegram"""
+    if not HELIUS_API_KEY:
+        return "Helius API key not configured.\n\nGet your free key at: helius.dev"
+
+    whales = fetch_helius_whale_transactions(min_sol=100)
+
+    if not whales:
+        return "No large whale transactions found recently."
+
+    total_volume = sum(w.get("amount_sol", 0) for w in whales)
+
+    lines = ["🐋 <b>Recent Whale Transactions</b>\n"]
+    lines.append(f"<b>Total Volume:</b> {total_volume:,.0f} SOL\n")
+
+    for w in whales[:7]:
+        amount = w.get("amount_sol", 0)
+        from_addr = w.get("from", "???")
+        to_addr = w.get("to", "???")
+        lines.append(f"• <b>{amount:,.0f} SOL</b>")
+        lines.append(f"  {from_addr} → {to_addr}")
+
+    lines.append("\n<i>Source: Helius</i>")
+    return "\n".join(lines)
+
 
 # ============================================================================
 # TELEGRAM FUNCTIONS
@@ -462,33 +1586,143 @@ def swap_tokens(from_token: str, to_token: str, amount: float) -> dict:
 # AI ANALYSIS
 # ============================================================================
 
-def analyze_with_ai(symbol: str, candles: list) -> tuple:
-    """Get AI trading decision using OpenAI"""
+def get_agent_context() -> str:
+    """Get context from external agent feeds"""
+    context_parts = []
+
+    for agent_name, data in AGENT_DATA.items():
+        if data.get("signal") and data.get("updated"):
+            # Only use data less than 30 minutes old
+            age = datetime.now() - data["updated"]
+            if age.total_seconds() < 1800:
+                context_parts.append(f"- {agent_name.upper()}: {data['message']}")
+
+    if context_parts:
+        return "External Signals:\n" + "\n".join(context_parts)
+    return ""
+
+def calculate_technicals(candles: list) -> dict:
+    """Calculate simple technical indicators from candles"""
+    if len(candles) < 10:
+        return {}
+
+    closes = []
+    for c in candles:
+        close = c.get('c', c.get('close', 0))
+        if close:
+            closes.append(float(close))
+
+    if len(closes) < 10:
+        return {}
+
+    # Simple Moving Averages
+    sma_5 = sum(closes[-5:]) / 5
+    sma_20 = sum(closes[-20:]) / min(20, len(closes)) if len(closes) >= 20 else sum(closes) / len(closes)
+
+    # Price momentum
+    current = closes[-1]
+    prev_5 = closes[-6] if len(closes) > 5 else closes[0]
+    momentum = ((current - prev_5) / prev_5) * 100 if prev_5 > 0 else 0
+
+    # Trend
+    trend = "BULLISH" if sma_5 > sma_20 else "BEARISH"
+
+    # Simple RSI approximation (gains vs losses over last 14 periods)
+    if len(closes) >= 14:
+        gains = []
+        losses = []
+        for i in range(-14, 0):
+            change = closes[i] - closes[i-1]
+            if change > 0:
+                gains.append(change)
+            else:
+                losses.append(abs(change))
+
+        avg_gain = sum(gains) / 14 if gains else 0.001
+        avg_loss = sum(losses) / 14 if losses else 0.001
+        rs = avg_gain / avg_loss if avg_loss > 0 else 100
+        rsi = 100 - (100 / (1 + rs))
+    else:
+        rsi = 50
+
+    return {
+        "sma_5": sma_5,
+        "sma_20": sma_20,
+        "momentum_5": momentum,
+        "trend": trend,
+        "rsi": rsi,
+        "current_price": current
+    }
+
+def analyze_with_ai(symbol: str, candles: list, wallet_balance: dict = None) -> tuple:
+    """Get AI trading decision using OpenAI with enhanced context"""
     if not OPENAI_KEY:
         print("OpenAI key not configured")
         return "NOTHING", 0, "No AI available"
 
     try:
-        # Format candle data
-        candle_text = f"Recent {symbol} price data (last 20 candles):\n"
-        for c in candles[-20:]:
+        # Calculate technicals
+        technicals = calculate_technicals(candles)
+
+        # Get agent context
+        agent_context = get_agent_context()
+
+        # Format wallet info
+        wallet_info = ""
+        if wallet_balance:
+            wallet_info = f"""
+Current Position:
+- SOL Balance: {wallet_balance.get('sol', 0):.4f} (${wallet_balance.get('sol_usd', 0):.2f})
+- USDC Balance: ${wallet_balance.get('usdc', 0):.2f}
+- Total Value: ${wallet_balance.get('total_usd', 0):.2f}
+"""
+
+        # Format technical analysis
+        tech_info = ""
+        if technicals:
+            tech_info = f"""
+Technical Analysis:
+- Current Price: ${technicals.get('current_price', 0):.4f}
+- SMA(5): ${technicals.get('sma_5', 0):.4f}
+- SMA(20): ${technicals.get('sma_20', 0):.4f}
+- 5-period Momentum: {technicals.get('momentum_5', 0):.2f}%
+- RSI(14): {technicals.get('rsi', 50):.1f}
+- Trend: {technicals.get('trend', 'NEUTRAL')}
+"""
+
+        # Format recent candles (last 10)
+        candle_text = f"Recent {symbol} hourly candles:\n"
+        for i, c in enumerate(candles[-10:]):
             o = c.get('o', c.get('open', 'N/A'))
             h = c.get('h', c.get('high', 'N/A'))
             l = c.get('l', c.get('low', 'N/A'))
             close = c.get('c', c.get('close', 'N/A'))
-            candle_text += f"Open: {o}, High: {h}, Low: {l}, Close: {close}\n"
+            try:
+                candle_text += f"  {i+1}. O:{float(o):.4f} H:{float(h):.4f} L:{float(l):.4f} C:{float(close):.4f}\n"
+            except:
+                candle_text += f"  {i+1}. O:{o} H:{h} L:{l} C:{close}\n"
 
-        prompt = f"""Analyze this {symbol} market data and decide: BUY, SELL, or HOLD.
+        prompt = f"""You are an AI trading assistant analyzing {symbol}.
 
+{tech_info}
 {candle_text}
+{wallet_info}
+{agent_context}
 
-Rules:
-- Respond with ONLY one word: BUY, SELL, or HOLD
-- BUY = bullish, good entry point
-- SELL = bearish, exit or take profits
-- HOLD = unclear, wait for better setup
+Based on this data, provide a trading recommendation.
 
-Your decision:"""
+RESPOND IN THIS EXACT FORMAT:
+DECISION: [BUY/SELL/HOLD]
+CONFIDENCE: [0-100]
+REASON: [One sentence explanation]
+
+Guidelines:
+- BUY when: RSI < 35 (oversold), bullish trend, positive momentum
+- SELL when: RSI > 70 (overbought), bearish trend, negative momentum
+- HOLD when: Mixed signals, RSI between 40-60, unclear trend
+- Confidence should reflect signal strength (70+ for clear signals)
+
+Your analysis:"""
 
         headers = {
             "Authorization": f"Bearer {OPENAI_KEY}",
@@ -498,10 +1732,10 @@ Your decision:"""
         payload = {
             "model": "gpt-4o-mini",
             "messages": [
-                {"role": "system", "content": "You are a crypto trading AI. Respond with only BUY, SELL, or HOLD."},
+                {"role": "system", "content": "You are a crypto trading AI. Always respond in the exact format requested: DECISION, CONFIDENCE, REASON."},
                 {"role": "user", "content": prompt}
             ],
-            "max_tokens": 10,
+            "max_tokens": 100,
             "temperature": 0.3
         }
 
@@ -513,14 +1747,34 @@ Your decision:"""
         )
 
         result = response.json()
-        decision = result["choices"][0]["message"]["content"].strip().upper()
+        content = result["choices"][0]["message"]["content"].strip()
 
-        if "BUY" in decision:
-            return "BUY", 75, "AI recommends BUY"
-        elif "SELL" in decision:
-            return "SELL", 75, "AI recommends SELL"
-        else:
-            return "HOLD", 50, "AI recommends HOLD"
+        # Parse response
+        decision = "HOLD"
+        confidence = 50
+        reason = "Analysis complete"
+
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.upper().startswith("DECISION:"):
+                decision_text = line.split(":", 1)[1].strip().upper()
+                if "BUY" in decision_text:
+                    decision = "BUY"
+                elif "SELL" in decision_text:
+                    decision = "SELL"
+                else:
+                    decision = "HOLD"
+            elif line.upper().startswith("CONFIDENCE:"):
+                try:
+                    conf_text = line.split(":", 1)[1].strip().replace("%", "")
+                    confidence = int(float(conf_text))
+                    confidence = max(0, min(100, confidence))
+                except:
+                    confidence = 50
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+
+        return decision, confidence, reason
 
     except Exception as e:
         print(f"AI error: {e}")
@@ -537,6 +1791,12 @@ class TelegramTradingBot:
         self.daily_trades = 0
         self.last_trade_date = datetime.now().date()
         self.active_token = DEFAULT_TOKEN
+
+        # Autonomous trading settings
+        self.auto_mode = False  # When True, AI can auto-execute trades
+        self.auto_confirm = True  # When True, ask for confirmation before executing
+        self.pending_trade = None  # {"action": "BUY", "amount": 0.01, "token": "SOL", "expires": datetime}
+        self.auto_trades_today = 0
 
         print("=" * 50)
         print("Moon Dev Telegram Trading Bot")
@@ -572,55 +1832,77 @@ class TelegramTradingBot:
         wallet = get_wallet_balance()
 
         # Send startup message
+        auto_status = "OFF"
         send_telegram(f"""<b>Moon Dev Trading Bot Started!</b>
 
 <b>Exchange:</b> Solana + Jupiter DEX
 <b>Token:</b> {self.active_token}
 <b>Interval:</b> {CHECK_INTERVAL_MINUTES} min
+<b>Auto Mode:</b> {auto_status}
 
 <b>Wallet:</b>
 SOL: {wallet.get('sol', 0):.4f} (${wallet.get('sol_usd', 0):.2f})
 USDC: ${wallet.get('usdc', 0):.2f}
 <b>Total:</b> ${wallet.get('total_usd', 0):.2f}
 
-Send /help for commands""")
+Send /help for commands
+Send /auto to enable AI trading""")
 
     def handle_command(self, cmd: str):
         """Handle Telegram command"""
         if cmd == "/help" or cmd == "/start":
-            send_telegram("""<b>Trading Bot Commands</b>
+            auto_status = "ON" if self.auto_mode else "OFF"
+            send_telegram(f"""<b>Trading Bot Commands</b>
 
-<b>Trading (REAL):</b>
-/buy [amount] [token] - Buy token with USDC
-/sell [amount] [token] - Sell token for USDC
+<b>Auto Trading:</b>
+/auto - Toggle AI trading ({auto_status})
+/confirm - Confirm trade
+/cancel - Cancel trade
 
-<b>Info:</b>
-/status - Check wallet balance
-/price - Get current SOL price
-/tokens - List available tokens
+<b>Trading:</b>
+/buy [amt] [token] - Buy token
+/sell [amt] [token] - Sell token
+/analyze - AI analysis
+
+<b>Market Data:</b>
+/sentiment - Fear & Greed
+/market - SOL price
+/btc - BTC dominance
+/trending - Hot coins
+/gainers - Top movers
+
+<b>DeFi Data:</b>
+/dex - DEX volume
+/yields - Best yields
+/stables - Stablecoin flows
+/tvl - Solana TVL
+
+<b>Pro Data (API key):</b>
+/birdeye - Token details
+/whales - Whale activity
+/exchanges - CEX volumes
 
 <b>Controls:</b>
-/pause - Pause AI signals
-/resume - Resume AI signals
-/trade - Get Jupiter swap link
-/help - Show this message
+/status - Bot status
+/pause /resume
+/data - All data feeds
 
-<b>Examples:</b>
-• /buy 0.01 sol - Buy 0.01 SOL
-• /sell 0.01 sol - Sell 0.01 SOL
-• /buy 1000 bonk - Buy 1000 BONK
-
-<b>Available:</b> SOL, BONK, WIF""")
+<i>Use /data to see all feeds</i>""")
 
         elif cmd == "/status":
             wallet = get_wallet_balance()
             status = "PAUSED" if self.is_paused else "ACTIVE"
+            auto_status = "ON" if self.auto_mode else "OFF"
+            pending = ""
+            if self.pending_trade:
+                pending = f"\n<b>Pending:</b> {self.pending_trade['action']} {self.pending_trade['amount']} {self.pending_trade['token']}"
 
             send_telegram(f"""<b>Bot Status</b>
 
 <b>Status:</b> {status}
+<b>Auto Mode:</b> {auto_status}
 <b>Active Token:</b> {self.active_token}
-<b>Today's Signals:</b> {self.daily_trades}
+<b>Today's Trades:</b> {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}{pending}
 
 <b>Wallet Balance:</b>
 SOL: {wallet.get('sol', 0):.4f} (${wallet.get('sol_usd', 0):.2f})
@@ -646,6 +1928,223 @@ USDC: ${wallet.get('usdc', 0):.2f}
 {token_list}
 
 Current: {self.active_token}""")
+
+        # Auto trading commands
+        elif cmd == "/auto" or cmd == "/auto toggle":
+            self.auto_mode = not self.auto_mode
+            status = "ON" if self.auto_mode else "OFF"
+            if self.auto_mode:
+                send_telegram(f"""<b>Auto Trading: {status}</b>
+
+AI will now analyze the market every {CHECK_INTERVAL_MINUTES} mins and propose trades.
+
+<b>Settings:</b>
+• Trade Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
+• Requires Confirmation: Yes
+• Max Daily Trades: {AUTO_MAX_DAILY_TRADES}
+
+When AI finds a signal, you'll get a notification to /confirm or /cancel.
+
+Send /auto off to disable.""")
+            else:
+                send_telegram(f"<b>Auto Trading: {status}</b>\n\nAI will only send signals, no trade proposals.")
+
+        elif cmd == "/auto on":
+            self.auto_mode = True
+            send_telegram(f"""<b>Auto Trading: ON</b>
+
+AI will analyze every {CHECK_INTERVAL_MINUTES} mins and propose trades.
+
+• Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
+• You must /confirm each trade
+• Max {AUTO_MAX_DAILY_TRADES} trades/day""")
+
+        elif cmd == "/auto off":
+            self.auto_mode = False
+            self.pending_trade = None
+            send_telegram("<b>Auto Trading: OFF</b>\n\nAI signals only, no trade proposals.")
+
+        elif cmd == "/confirm" or cmd == "/yes":
+            if not self.pending_trade:
+                send_telegram("No pending trade to confirm.\n\nUse /analyze to get AI recommendation.")
+                return
+
+            trade = self.pending_trade
+            self.pending_trade = None
+
+            send_telegram(f"<b>Executing {trade['action']}...</b>\n\n{trade['amount']} {trade['token']}")
+
+            if trade['action'] == "BUY":
+                result = buy_token(trade['token'], trade['amount'])
+            else:
+                result = sell_token(trade['token'], trade['amount'])
+
+            if result.get("success"):
+                self.auto_trades_today += 1
+                send_telegram(f"""<b>{trade['action']} SUCCESS!</b>
+
+<b>Amount:</b> {trade['amount']} {trade['token']}
+<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
+
+Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
+            else:
+                send_telegram(f"""<b>{trade['action']} FAILED</b>
+
+<b>Error:</b> {result.get('error')}
+
+Try /analyze to get a new signal.""")
+
+        elif cmd == "/cancel" or cmd == "/no":
+            if self.pending_trade:
+                trade = self.pending_trade
+                self.pending_trade = None
+                send_telegram(f"<b>Trade Cancelled</b>\n\n{trade['action']} {trade['amount']} {trade['token']} cancelled.")
+            else:
+                send_telegram("No pending trade to cancel.")
+
+        elif cmd == "/analyze" or cmd == "/signal":
+            send_telegram("<b>Analyzing market...</b>\n\nPlease wait...")
+
+            wallet = get_wallet_balance()
+            token_address = TOKENS.get(self.active_token, SOL_ADDRESS)
+            candles = get_birdeye_candles(token_address, "1H", 50) if BIRDEYE_API_KEY else []
+
+            if not candles:
+                price = get_token_price(self.active_token)
+                candles = [{"close": price}]
+
+            action, confidence, reason = analyze_with_ai(self.active_token, candles, wallet)
+
+            # Calculate technicals for display
+            technicals = calculate_technicals(candles)
+
+            tech_display = ""
+            if technicals:
+                tech_display = f"""
+<b>Technicals:</b>
+• RSI: {technicals.get('rsi', 50):.1f}
+• Trend: {technicals.get('trend', 'N/A')}
+• Momentum: {technicals.get('momentum_5', 0):.2f}%"""
+
+            emoji = "🟢" if action == "BUY" else "🔴" if action == "SELL" else "⚪"
+
+            msg = f"""<b>{emoji} AI Analysis: {self.active_token}</b>
+
+<b>Decision:</b> {action}
+<b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reason}
+{tech_display}
+<b>Price:</b> ${get_token_price(self.active_token):,.4f}"""
+
+            if self.auto_mode and action != "HOLD" and confidence >= MIN_CONFIDENCE:
+                if self.auto_trades_today < AUTO_MAX_DAILY_TRADES:
+                    # Create pending trade
+                    self.pending_trade = {
+                        "action": action,
+                        "amount": AUTO_TRADE_AMOUNT,
+                        "token": self.active_token,
+                        "expires": datetime.now() + timedelta(seconds=AUTO_CONFIRM_TIMEOUT)
+                    }
+                    msg += f"""
+
+<b>Proposed Trade:</b>
+{action} {AUTO_TRADE_AMOUNT} {self.active_token}
+
+Reply /confirm to execute
+Reply /cancel to skip"""
+                else:
+                    msg += "\n\n<i>Daily trade limit reached.</i>"
+
+            send_telegram(msg)
+
+        elif cmd == "/sentiment" or cmd == "/fear" or cmd == "/greed":
+            send_telegram("<b>Checking market sentiment...</b>")
+            update_sentiment_data()
+            send_telegram(get_sentiment_status())
+
+        elif cmd == "/market" or cmd == "/sol":
+            send_telegram("<b>Fetching SOL market data...</b>")
+            update_volume_data()
+            send_telegram(get_market_status())
+
+        elif cmd == "/trending" or cmd == "/hot":
+            send_telegram("<b>Fetching trending coins...</b>")
+            send_telegram(get_trending_status())
+
+        elif cmd == "/btc" or cmd == "/dominance":
+            send_telegram("<b>Fetching BTC dominance...</b>")
+            send_telegram(get_btc_dominance_status())
+
+        elif cmd == "/tvl" or cmd == "/defi":
+            send_telegram("<b>Fetching Solana TVL...</b>")
+            send_telegram(get_tvl_status())
+
+        elif cmd == "/gainers" or cmd == "/losers" or cmd == "/movers":
+            send_telegram("<b>Fetching top movers...</b>")
+            send_telegram(get_gainers_status())
+
+        # New DeFi data commands
+        elif cmd == "/dex" or cmd == "/dexvolume":
+            send_telegram("<b>Fetching Solana DEX volume...</b>")
+            send_telegram(get_dex_volume_status())
+
+        elif cmd == "/yields" or cmd == "/apy" or cmd == "/yield":
+            send_telegram("<b>Fetching best DeFi yields...</b>")
+            send_telegram(get_yields_status())
+
+        elif cmd == "/stables" or cmd == "/stablecoins" or cmd == "/stable":
+            send_telegram("<b>Fetching stablecoin flows...</b>")
+            send_telegram(get_stablecoin_status())
+
+        elif cmd == "/exchanges" or cmd == "/cex":
+            send_telegram("<b>Fetching exchange volumes...</b>")
+            send_telegram(get_exchange_status())
+
+        # API key required commands
+        elif cmd == "/birdeye" or cmd.startswith("/birdeye "):
+            token = "SOL"
+            if cmd.startswith("/birdeye "):
+                token = cmd.replace("/birdeye ", "").strip().upper()
+            send_telegram(f"<b>Fetching Birdeye data for {token}...</b>")
+            send_telegram(get_birdeye_status(token))
+
+        elif cmd == "/whales" or cmd == "/whale":
+            send_telegram("<b>Fetching whale transactions...</b>")
+            send_telegram(get_whale_status())
+
+        # Overview of all data feeds
+        elif cmd == "/data" or cmd == "/feeds" or cmd == "/all":
+            send_telegram("<b>Refreshing all data feeds...</b>")
+
+            # Update all feeds
+            update_sentiment_data()
+            update_volume_data()
+            update_tvl_data()
+            update_dominance_data()
+            update_dex_volume_data()
+            update_yields_data()
+            update_stablecoin_data()
+            if HELIUS_API_KEY:
+                update_whale_data()
+
+            # Build summary
+            lines = ["📊 <b>All Data Feeds</b>\n"]
+
+            for name, data in AGENT_DATA.items():
+                if data.get("signal") and data.get("updated"):
+                    age = datetime.now() - data["updated"]
+                    age_mins = age.total_seconds() / 60
+
+                    signal_emoji = "🟢" if data["signal"] == "BULLISH" else "🔴" if data["signal"] == "BEARISH" else "⚪"
+                    lines.append(f"{signal_emoji} <b>{name.upper()}</b>: {data['message']}")
+
+            # Add API key status
+            lines.append("\n<b>API Status:</b>")
+            lines.append(f"• Birdeye: {'✅' if BIRDEYE_API_KEY else '❌ (get at birdeye.so)'}")
+            lines.append(f"• Helius: {'✅' if HELIUS_API_KEY else '❌ (get at helius.dev)'}")
+
+            lines.append("\n<i>Use individual commands for details</i>")
+            send_telegram("\n".join(lines))
 
         elif cmd.startswith("/buy") or cmd.startswith("buy "):
             # Parse various formats:
@@ -812,15 +2311,76 @@ Or /trade usdc sol to get a swap link""")
             print("Bot is paused, skipping cycle")
             return
 
+        # Check for expired pending trades
+        if self.pending_trade:
+            if datetime.now() > self.pending_trade.get("expires", datetime.now()):
+                print("Pending trade expired, clearing...")
+                self.pending_trade = None
+
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Running trading cycle...")
 
         try:
+            # Update free data feeds (sentiment + market data)
+            print("Updating sentiment data...")
+            old_sentiment = AGENT_DATA.get("sentiment", {}).get("value", 50)
+            update_sentiment_data()
+            new_sentiment = AGENT_DATA.get("sentiment", {}).get("value", 50)
+
+            # Alert on extreme sentiment changes
+            if new_sentiment <= 25 and old_sentiment > 25:
+                send_telegram(f"""<b>😱 EXTREME FEAR ALERT!</b>
+
+Fear & Greed: {new_sentiment}/100
+<b>Signal:</b> 🟢 BULLISH
+
+<i>Market is fearful - potential buy opportunity!</i>""")
+            elif new_sentiment >= 75 and old_sentiment < 75:
+                send_telegram(f"""<b>🤑 EXTREME GREED ALERT!</b>
+
+Fear & Greed: {new_sentiment}/100
+<b>Signal:</b> 🔴 BEARISH
+
+<i>Market may be overheated - consider taking profits!</i>""")
+
+            print("Updating market data...")
+            update_volume_data()
+
+            # Alert on big price moves
+            price_change = AGENT_DATA.get("volume", {}).get("price_change", 0)
+            if abs(price_change) > 7:
+                direction = "up" if price_change > 0 else "down"
+                emoji = "🚀" if price_change > 0 else "💥"
+                send_telegram(f"""<b>{emoji} BIG MOVE ALERT!</b>
+
+SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
+
+<i>Check /market for details</i>""")
+
+            # Update TVL and dominance data (for AI context)
+            print("Updating TVL and dominance...")
+            update_tvl_data()
+            update_dominance_data()
+
+            # Update new DeFi data feeds
+            print("Updating DeFi data (DEX, yields, stables)...")
+            update_dex_volume_data()
+            update_yields_data()
+            update_stablecoin_data()
+
+            # Update whale data if Helius is configured
+            if HELIUS_API_KEY:
+                print("Updating whale data...")
+                update_whale_data()
+
             symbol = self.active_token
             token_address = TOKENS.get(symbol, SOL_ADDRESS)
 
             # Get price
             price = get_token_price(symbol)
             print(f"{symbol}: ${price:,.4f}")
+
+            # Get wallet balance for context
+            wallet = get_wallet_balance()
 
             # Get candles (if Birdeye is configured)
             candles = []
@@ -832,31 +2392,59 @@ Or /trade usdc sol to get a swap link""")
                 print("No candle data, using price-only analysis")
                 candles = [{"close": price}]
 
-            # Get AI analysis
-            action, confidence, reasoning = analyze_with_ai(symbol, candles)
-            print(f"AI Decision: {action} ({confidence}%)")
+            # Get AI analysis with enhanced context
+            action, confidence, reasoning = analyze_with_ai(symbol, candles, wallet)
+            print(f"AI Decision: {action} ({confidence}%) - {reasoning}")
 
-            # Alert on high-confidence signals
+            # Check for actionable signals
             if confidence >= MIN_CONFIDENCE and action != "HOLD":
                 self.daily_trades += 1
 
-                if action == "BUY":
-                    send_telegram(f"""<b>BUY SIGNAL</b> - {symbol}
+                emoji = "🟢" if action == "BUY" else "🔴"
+
+                # Calculate technicals for display
+                technicals = calculate_technicals(candles)
+                tech_display = ""
+                if technicals:
+                    tech_display = f"""
+<b>Technicals:</b>
+• RSI: {technicals.get('rsi', 50):.1f}
+• Trend: {technicals.get('trend', 'N/A')}"""
+
+                # Auto mode: propose trade for confirmation
+                if self.auto_mode and self.auto_trades_today < AUTO_MAX_DAILY_TRADES:
+                    if not self.pending_trade:  # Don't overwrite existing pending trade
+                        self.pending_trade = {
+                            "action": action,
+                            "amount": AUTO_TRADE_AMOUNT,
+                            "token": symbol,
+                            "expires": datetime.now() + timedelta(seconds=AUTO_CONFIRM_TIMEOUT)
+                        }
+
+                        send_telegram(f"""<b>{emoji} {action} SIGNAL</b> - {symbol}
 
 <b>Price:</b> ${price:,.4f}
 <b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reasoning}
+{tech_display}
 
-<i>Execute on Jupiter: jup.ag</i>
-<i>This is a signal only - manual trade required</i>""")
+<b>Proposed Trade:</b>
+{action} {AUTO_TRADE_AMOUNT} {symbol}
 
-                elif action == "SELL":
-                    send_telegram(f"""<b>SELL SIGNAL</b> - {symbol}
+/confirm - Execute trade
+/cancel - Skip this signal
+
+<i>Expires in 60 seconds</i>""")
+                else:
+                    # Signal only mode (auto mode off or limit reached)
+                    send_telegram(f"""<b>{emoji} {action} SIGNAL</b> - {symbol}
 
 <b>Price:</b> ${price:,.4f}
 <b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reasoning}
+{tech_display}
 
-<i>Execute on Jupiter: jup.ag</i>
-<i>Consider taking profits if in position</i>""")
+<i>Use /buy or /sell to trade manually</i>""")
 
         except Exception as e:
             print(f"Error in cycle: {e}")
@@ -867,10 +2455,12 @@ Or /trade usdc sol to get a swap link""")
 
         while self.running:
             try:
-                # Reset daily trades at midnight
+                # Reset daily counters at midnight
                 if datetime.now().date() != self.last_trade_date:
                     self.daily_trades = 0
+                    self.auto_trades_today = 0
                     self.last_trade_date = datetime.now().date()
+                    print("Daily counters reset")
 
                 # Check Telegram commands
                 cmd = check_telegram_commands()
