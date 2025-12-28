@@ -1739,7 +1739,13 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
                 "userPublicKey": str(keypair.pubkey()),
                 "wrapUnwrapSOL": True,
                 "dynamicComputeUnitLimit": True,
-                "prioritizationFeeLamports": "auto"
+                "dynamicSlippage": True,  # Let Jupiter handle slippage dynamically
+                "prioritizationFeeLamports": {
+                    "priorityLevelWithMaxLamports": {
+                        "maxLamports": 1000000,  # Up to 0.001 SOL for priority
+                        "priorityLevel": "high"
+                    }
+                }
             },
             timeout=30
         )
@@ -1771,51 +1777,70 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
                 signed_tx_base64,
                 {
                     "encoding": "base64",
-                    "skipPreflight": False,
-                    "preflightCommitment": "confirmed",
-                    "maxRetries": 3
+                    "skipPreflight": True,  # Skip simulation to avoid stale data errors
+                    "preflightCommitment": "processed",
+                    "maxRetries": 5
                 }
             ]
         }
 
-        rpc_response = requests.post(RPC_ENDPOINT, json=rpc_payload, timeout=30)
-        rpc_result = rpc_response.json()
+        # Try primary RPC endpoint first
+        rpc_endpoints = [RPC_ENDPOINT, "https://api.mainnet-beta.solana.com"]
+        rpc_result = None
 
-        # Check result
-        if "result" in rpc_result:
-            tx_sig = rpc_result["result"]
-            print(f"Transaction sent: {tx_sig}")
-            return {
-                "success": True,
-                "signature": tx_sig,
-                "out_amount": out_amount,
-                "url": f"https://solscan.io/tx/{tx_sig}"
-            }
-        elif "error" in rpc_result:
-            error_msg = rpc_result["error"].get("message", str(rpc_result["error"]))
+        for rpc_url in rpc_endpoints:
+            try:
+                print(f"Trying RPC: {rpc_url[:40]}...")
+                rpc_response = requests.post(rpc_url, json=rpc_payload, timeout=30)
+                rpc_result = rpc_response.json()
 
-            # Check for slippage error (0x1788 = 6024) and retry with higher slippage
-            if "0x1788" in error_msg or "6024" in error_msg or "Slippage" in error_msg:
-                if retry_count < 3:  # Max 3 retries
-                    print(f"Slippage error detected, retrying with higher slippage...")
-                    import time
-                    time.sleep(1)  # Brief pause before retry
-                    return execute_swap(input_mint, output_mint, amount, current_slippage, retry_count + 1)
+                if "result" in rpc_result:
+                    tx_sig = rpc_result["result"]
+                    print(f"Transaction sent: {tx_sig}")
+                    return {
+                        "success": True,
+                        "signature": tx_sig,
+                        "out_amount": out_amount,
+                        "url": f"https://solscan.io/tx/{tx_sig}"
+                    }
+                elif "error" in rpc_result:
+                    error_msg = rpc_result["error"].get("message", str(rpc_result["error"]))
+                    print(f"RPC error from {rpc_url[:30]}: {error_msg[:50]}")
 
-            return {"success": False, "error": f"RPC error: {error_msg}"}
-        else:
-            return {"success": False, "error": f"Unknown RPC response: {rpc_result}"}
+                    # Check for slippage error (0x1788 = 6024) - retry with fresh quote
+                    if "0x1788" in error_msg or "6024" in error_msg or "Slippage" in error_msg:
+                        if retry_count < 2:
+                            print(f"Slippage error detected, getting fresh quote...")
+                            import time
+                            time.sleep(2)  # Wait for market to settle
+                            return execute_swap(input_mint, output_mint, amount, None, retry_count + 1)
+                        else:
+                            return {"success": False, "error": f"Slippage error persists after retries. Try a smaller trade amount."}
+
+                    # Try next RPC on other errors
+                    continue
+            except requests.exceptions.Timeout:
+                print(f"RPC timeout on {rpc_url[:30]}, trying next...")
+                continue
+            except Exception as e:
+                print(f"RPC error on {rpc_url[:30]}: {e}")
+                continue
+
+        # All RPCs failed
+        if rpc_result and "error" in rpc_result:
+            return {"success": False, "error": f"RPC error: {rpc_result['error'].get('message', str(rpc_result['error']))}"}
+        return {"success": False, "error": "All RPC endpoints failed"}
 
     except Exception as e:
         error_str = str(e)
         print(f"Swap error: {e}")
 
-        # Check for slippage error in exception and retry
-        if ("0x1788" in error_str or "6024" in error_str or "Slippage" in error_str) and retry_count < 3:
-            print(f"Slippage error detected, retrying with higher slippage...")
+        # Check for slippage error in exception and retry with fresh quote
+        if ("0x1788" in error_str or "6024" in error_str or "Slippage" in error_str) and retry_count < 2:
+            print(f"Slippage error detected, getting fresh quote...")
             import time
-            time.sleep(1)
-            return execute_swap(input_mint, output_mint, amount, current_slippage, retry_count + 1)
+            time.sleep(2)
+            return execute_swap(input_mint, output_mint, amount, None, retry_count + 1)
 
         return {"success": False, "error": error_str}
 
