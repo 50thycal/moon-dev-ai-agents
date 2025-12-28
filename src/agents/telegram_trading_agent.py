@@ -55,7 +55,7 @@ TOKENS = {
 }
 DEFAULT_TOKEN = "SOL"
 TRADE_SIZE_USD = 10  # Default trade size in USD
-SLIPPAGE_BPS = 500  # 5% slippage
+SLIPPAGE_BPS = 1500  # 15% slippage (higher for volatile markets)
 CHECK_INTERVAL_MINUTES = 15
 MIN_CONFIDENCE = 70  # Minimum confidence for auto-trading
 
@@ -841,8 +841,22 @@ def fetch_helius_whale_transactions(min_sol: float = 100) -> list:
         # Use Helius RPC endpoint (free tier compatible)
         helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-        # Get recent signatures for a known whale wallet or use getRecentBlockhash
-        # For simplicity, we'll get recent confirmed signatures
+        # First test with a simple getHealth call to verify API key works
+        test_payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getHealth"
+        }
+
+        test_response = requests.post(helius_rpc, json=test_payload, timeout=10)
+        if test_response.status_code == 401:
+            print(f"Helius API key invalid or expired. Get a new key at helius.dev")
+            return None
+        elif test_response.status_code != 200:
+            print(f"Helius connection error: {test_response.status_code}")
+            return None
+
+        # Get recent signatures for a known whale wallet
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -1677,10 +1691,20 @@ def get_token_balance(wallet_address: str, token_mint: str) -> float:
         print(f"Token balance error: {e}")
         return 0
 
-def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
-    """Execute a swap via Jupiter - using direct HTTP calls (no solana SDK needed)"""
+def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: int = None, retry_count: int = 0) -> dict:
+    """Execute a swap via Jupiter - using direct HTTP calls (no solana SDK needed)
+
+    Includes retry logic with increasing slippage for volatile markets.
+    """
     if not SOLANA_PRIVATE_KEY:
         return {"success": False, "error": "No private key configured"}
+
+    # Use provided slippage or default, increase on retries
+    current_slippage = slippage_bps or SLIPPAGE_BPS
+    if retry_count > 0:
+        # Increase slippage by 500 bps (5%) per retry, up to 50%
+        current_slippage = min(5000, current_slippage + (retry_count * 500))
+        print(f"Retry {retry_count}: Increasing slippage to {current_slippage/100}%")
 
     try:
         import base64
@@ -1692,9 +1716,9 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
         print(f"Executing swap: {input_mint[:8]}... -> {output_mint[:8]}...")
         print(f"Amount: {amount}")
 
-        # Get quote from Jupiter
-        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={SLIPPAGE_BPS}"
-        print(f"Getting quote...")
+        # Get quote from Jupiter with current slippage
+        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={current_slippage}"
+        print(f"Getting quote (slippage: {current_slippage/100}%)...")
         quote_response = requests.get(quote_url, timeout=15)
         quote = quote_response.json()
 
@@ -1769,13 +1793,31 @@ def execute_swap(input_mint: str, output_mint: str, amount: int) -> dict:
             }
         elif "error" in rpc_result:
             error_msg = rpc_result["error"].get("message", str(rpc_result["error"]))
+
+            # Check for slippage error (0x1788 = 6024) and retry with higher slippage
+            if "0x1788" in error_msg or "6024" in error_msg or "Slippage" in error_msg:
+                if retry_count < 3:  # Max 3 retries
+                    print(f"Slippage error detected, retrying with higher slippage...")
+                    import time
+                    time.sleep(1)  # Brief pause before retry
+                    return execute_swap(input_mint, output_mint, amount, current_slippage, retry_count + 1)
+
             return {"success": False, "error": f"RPC error: {error_msg}"}
         else:
             return {"success": False, "error": f"Unknown RPC response: {rpc_result}"}
 
     except Exception as e:
+        error_str = str(e)
         print(f"Swap error: {e}")
-        return {"success": False, "error": str(e)}
+
+        # Check for slippage error in exception and retry
+        if ("0x1788" in error_str or "6024" in error_str or "Slippage" in error_str) and retry_count < 3:
+            print(f"Slippage error detected, retrying with higher slippage...")
+            import time
+            time.sleep(1)
+            return execute_swap(input_mint, output_mint, amount, current_slippage, retry_count + 1)
+
+        return {"success": False, "error": error_str}
 
 
 def buy_token(token_symbol: str, token_amount: float) -> dict:
