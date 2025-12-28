@@ -818,38 +818,86 @@ def fetch_birdeye_trades(token_address: str, limit: int = 20) -> list:
 # ============================================================================
 
 def fetch_helius_whale_transactions(min_sol: float = 100) -> list:
-    """Fetch large SOL transactions from Helius"""
+    """Fetch large SOL transactions from Helius using free-tier RPC"""
     if not HELIUS_API_KEY:
         return None
 
     try:
-        # Get recent signatures for SOL transfers
-        url = f"https://api.helius.xyz/v0/addresses/{SOL_ADDRESS}/transactions?api-key={HELIUS_API_KEY}&limit=50"
-        response = requests.get(url, timeout=15)
+        # Use Helius RPC endpoint (free tier compatible)
+        helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+
+        # Get recent signatures for a known whale wallet or use getRecentBlockhash
+        # For simplicity, we'll get recent confirmed signatures
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getSignaturesForAddress",
+            "params": [
+                "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",  # Known large wallet
+                {"limit": 20}
+            ]
+        }
+
+        response = requests.post(helius_rpc, json=payload, timeout=15)
 
         if response.status_code != 200:
-            print(f"Helius API error: {response.status_code}")
+            print(f"Helius RPC error: {response.status_code}")
             return None
 
-        transactions = response.json()
+        data = response.json()
+        signatures = data.get("result", [])
 
-        # Filter for large transfers
+        if not signatures:
+            return []
+
+        # Get transaction details for each signature
         whales = []
-        for tx in transactions:
-            # Look for native transfers
-            native_transfers = tx.get("nativeTransfers", [])
-            for transfer in native_transfers:
-                amount_sol = transfer.get("amount", 0) / 1_000_000_000
-                if amount_sol >= min_sol:
-                    whales.append({
-                        "signature": tx.get("signature", "")[:16] + "...",
-                        "amount_sol": amount_sol,
-                        "from": transfer.get("fromUserAccount", "")[:8] + "...",
-                        "to": transfer.get("toUserAccount", "")[:8] + "...",
-                        "timestamp": tx.get("timestamp", 0)
-                    })
+        for sig_info in signatures[:10]:
+            sig = sig_info.get("signature")
+            if not sig:
+                continue
 
-        return whales[:10]  # Top 10 whale moves
+            # Get parsed transaction
+            tx_payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    sig,
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ]
+            }
+
+            tx_response = requests.post(helius_rpc, json=tx_payload, timeout=10)
+            if tx_response.status_code != 200:
+                continue
+
+            tx_data = tx_response.json().get("result")
+            if not tx_data:
+                continue
+
+            # Look for large SOL transfers in pre/post balances
+            meta = tx_data.get("meta", {})
+            pre_balances = meta.get("preBalances", [])
+            post_balances = meta.get("postBalances", [])
+
+            if pre_balances and post_balances:
+                # Calculate the largest balance change
+                for i, (pre, post) in enumerate(zip(pre_balances, post_balances)):
+                    change_lamports = abs(post - pre)
+                    change_sol = change_lamports / 1_000_000_000
+
+                    if change_sol >= min_sol:
+                        whales.append({
+                            "signature": sig[:16] + "...",
+                            "amount_sol": change_sol,
+                            "from": "whale",
+                            "to": "transfer",
+                            "timestamp": tx_data.get("blockTime", 0)
+                        })
+                        break
+
+        return whales[:10]
 
     except Exception as e:
         print(f"Error fetching Helius whale data: {e}")
