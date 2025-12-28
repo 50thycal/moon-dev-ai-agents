@@ -62,7 +62,13 @@ MIN_CONFIDENCE = 70  # Minimum confidence for auto-trading
 # Autonomous Trading Settings
 AUTO_TRADE_AMOUNT = 0.01  # Amount to trade in token units when auto mode is on
 AUTO_CONFIRM_TIMEOUT = 60  # Seconds to wait for user confirmation (0 = no confirmation needed)
-AUTO_MAX_DAILY_TRADES = 5  # Max trades per day in auto mode
+AUTO_MAX_DAILY_TRADES = 10  # Max trades per day in auto mode
+
+# Full Autonomous Mode Settings
+FULL_AUTO_MODE = False      # When True, trades execute WITHOUT confirmation
+FULL_AUTO_REENTRY = True    # Re-enter positions after SL/TP triggers
+FULL_AUTO_MAX_LOSS_USD = 50  # Max daily loss before pausing (safety limit)
+FULL_AUTO_COOLDOWN = 5      # Minutes to wait between trades
 
 # Risk Management Settings
 DEFAULT_STOP_LOSS_PCT = 5.0      # Default stop loss percentage (5%)
@@ -2047,6 +2053,14 @@ class TelegramTradingBot:
         self.pending_trade = None  # {"action": "BUY", "amount": 0.01, "token": "SOL", "expires": datetime}
         self.auto_trades_today = 0
 
+        # Full autonomous mode
+        self.full_auto = FULL_AUTO_MODE  # When True, NO confirmation needed
+        self.daily_pnl = 0.0  # Track daily profit/loss
+        self.last_trade_time = None  # For cooldown
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+
         print("=" * 50)
         print("Moon Dev Telegram Trading Bot")
         print("Exchange: Solana + Jupiter DEX")
@@ -2081,7 +2095,7 @@ class TelegramTradingBot:
         wallet = get_wallet_balance()
 
         # Send startup message
-        auto_status = "OFF"
+        auto_status = "FULL AUTO 🤖" if self.full_auto else ("ON" if self.auto_mode else "OFF")
         send_telegram(f"""<b>Moon Dev Trading Bot Started!</b>
 
 <b>Exchange:</b> Solana + Jupiter DEX
@@ -2094,8 +2108,12 @@ SOL: {wallet.get('sol', 0):.4f} (${wallet.get('sol_usd', 0):.2f})
 USDC: ${wallet.get('usdc', 0):.2f}
 <b>Total:</b> ${wallet.get('total_usd', 0):.2f}
 
-Send /help for commands
-Send /auto to enable AI trading""")
+<b>Risk Management:</b>
+🛑 Stop Loss: {DEFAULT_STOP_LOSS_PCT}%
+🎯 Take Profit: {DEFAULT_TAKE_PROFIT_PCT}%
+
+Send /fullauto for hands-free trading
+Send /help for all commands""")
 
     def handle_command(self, cmd: str):
         """Handle Telegram command"""
@@ -2104,7 +2122,8 @@ Send /auto to enable AI trading""")
             send_telegram(f"""<b>Trading Bot Commands</b>
 
 <b>Auto Trading:</b>
-/auto - Toggle AI trading ({auto_status})
+/fullauto - FULL autonomous mode
+/auto - Semi-auto (needs confirm)
 /confirm - Confirm trade
 /cancel - Cancel trade
 
@@ -2185,14 +2204,87 @@ USDC: ${wallet.get('usdc', 0):.2f}
 
 Current: {self.active_token}""")
 
-        # Auto trading commands
+        # Full autonomous trading mode
+        elif cmd == "/fullauto" or cmd == "/fullauto toggle":
+            self.full_auto = not self.full_auto
+            self.auto_mode = self.full_auto  # Full auto requires auto mode on
+
+            if self.full_auto:
+                send_telegram(f"""🤖 <b>FULL AUTO MODE: ON</b>
+
+The bot will now trade <b>completely autonomously</b>:
+
+<b>How it works:</b>
+1. AI analyzes market every {CHECK_INTERVAL_MINUTES} mins
+2. When signal is strong (≥{MIN_CONFIDENCE}% confidence), it BUYS
+3. Position tracked with SL/TP
+4. Auto-sells on stop loss or take profit
+5. Looks for next opportunity and repeats
+
+<b>Settings:</b>
+• Trade Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
+• Stop Loss: {DEFAULT_STOP_LOSS_PCT}%
+• Take Profit: {DEFAULT_TAKE_PROFIT_PCT}%
+• Max Daily Trades: {AUTO_MAX_DAILY_TRADES}
+• Max Daily Loss: ${FULL_AUTO_MAX_LOSS_USD}
+• Cooldown: {FULL_AUTO_COOLDOWN} min between trades
+
+<b>Safety:</b> Bot pauses if daily loss exceeds ${FULL_AUTO_MAX_LOSS_USD}
+
+Send /fullauto off to disable
+Send /position to monitor
+Send /stats to see performance""")
+            else:
+                send_telegram("""🤖 <b>FULL AUTO MODE: OFF</b>
+
+Autonomous trading disabled.
+Use /auto for semi-auto (requires confirmation).""")
+
+        elif cmd == "/fullauto on":
+            self.full_auto = True
+            self.auto_mode = True
+            send_telegram(f"""🤖 <b>FULL AUTO MODE: ON</b>
+
+Bot is now trading autonomously!
+
+• Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
+• SL: {DEFAULT_STOP_LOSS_PCT}% | TP: {DEFAULT_TAKE_PROFIT_PCT}%
+• Max loss: ${FULL_AUTO_MAX_LOSS_USD}/day
+
+Use /position to monitor positions.""")
+
+        elif cmd == "/fullauto off":
+            self.full_auto = False
+            send_telegram("🤖 <b>FULL AUTO MODE: OFF</b>\n\nAutonomous trading disabled.")
+
+        elif cmd == "/stats" or cmd == "/performance":
+            win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
+            send_telegram(f"""📊 <b>Trading Statistics</b>
+
+<b>Today:</b>
+• Trades: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}
+• P&L: ${self.daily_pnl:+.2f}
+
+<b>Session:</b>
+• Total Trades: {self.total_trades}
+• Winning: {self.winning_trades} ({win_rate:.0f}%)
+• Losing: {self.losing_trades}
+
+<b>Mode:</b> {'🤖 FULL AUTO' if self.full_auto else ('⚡ Semi-Auto' if self.auto_mode else '👤 Manual')}
+<b>Status:</b> {'⏸ PAUSED' if self.is_paused else '▶️ RUNNING'}""")
+
+        # Semi-auto trading commands
         elif cmd == "/auto" or cmd == "/auto toggle":
+            if self.full_auto:
+                send_telegram("Full auto is ON. Use /fullauto off first, then /auto for semi-auto mode.")
+                return
+
             self.auto_mode = not self.auto_mode
             status = "ON" if self.auto_mode else "OFF"
             if self.auto_mode:
-                send_telegram(f"""<b>Auto Trading: {status}</b>
+                send_telegram(f"""<b>Semi-Auto Trading: {status}</b>
 
-AI will now analyze the market every {CHECK_INTERVAL_MINUTES} mins and propose trades.
+AI will analyze every {CHECK_INTERVAL_MINUTES} mins and propose trades.
 
 <b>Settings:</b>
 • Trade Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
@@ -2201,24 +2293,30 @@ AI will now analyze the market every {CHECK_INTERVAL_MINUTES} mins and propose t
 
 When AI finds a signal, you'll get a notification to /confirm or /cancel.
 
-Send /auto off to disable.""")
+For hands-free trading, use /fullauto instead.""")
             else:
                 send_telegram(f"<b>Auto Trading: {status}</b>\n\nAI will only send signals, no trade proposals.")
 
         elif cmd == "/auto on":
+            if self.full_auto:
+                send_telegram("Full auto is ON. Use /fullauto off first.")
+                return
             self.auto_mode = True
-            send_telegram(f"""<b>Auto Trading: ON</b>
+            send_telegram(f"""<b>Semi-Auto Trading: ON</b>
 
 AI will analyze every {CHECK_INTERVAL_MINUTES} mins and propose trades.
 
 • Amount: {AUTO_TRADE_AMOUNT} {self.active_token}
 • You must /confirm each trade
-• Max {AUTO_MAX_DAILY_TRADES} trades/day""")
+• Max {AUTO_MAX_DAILY_TRADES} trades/day
+
+For hands-free: /fullauto""")
 
         elif cmd == "/auto off":
             self.auto_mode = False
+            self.full_auto = False
             self.pending_trade = None
-            send_telegram("<b>Auto Trading: OFF</b>\n\nAI signals only, no trade proposals.")
+            send_telegram("<b>Auto Trading: OFF</b>\n\nAll auto trading disabled.")
 
         elif cmd == "/confirm" or cmd == "/yes":
             if not self.pending_trade:
@@ -2828,12 +2926,22 @@ SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
                             result = sell_token(token, pos['amount'])
                             if result.get("success"):
                                 close_position(token)
+                                # Track stats
+                                self.daily_pnl += pnl_usd
+                                self.total_trades += 1
+                                self.losing_trades += 1
+                                self.last_trade_time = datetime.now()
+
+                                reentry_msg = ""
+                                if self.full_auto and FULL_AUTO_REENTRY:
+                                    reentry_msg = "\n\n<i>Looking for next opportunity...</i>"
+
                                 send_telegram(f"""<b>Stop Loss Executed!</b>
 
 <b>Sold:</b> {pos['amount']} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
-Position closed. Capital protected.""")
+<b>Daily P&L:</b> ${self.daily_pnl:.2f}{reentry_msg}""")
                             else:
                                 send_telegram(f"""<b>Stop Loss FAILED!</b>
 
@@ -2856,12 +2964,22 @@ Use /sell {pos['amount']} {token.lower()}""")
                             result = sell_token(token, pos['amount'])
                             if result.get("success"):
                                 close_position(token)
+                                # Track stats
+                                self.daily_pnl += pnl_usd
+                                self.total_trades += 1
+                                self.winning_trades += 1
+                                self.last_trade_time = datetime.now()
+
+                                reentry_msg = ""
+                                if self.full_auto and FULL_AUTO_REENTRY:
+                                    reentry_msg = "\n\n<i>Looking for next opportunity...</i>"
+
                                 send_telegram(f"""<b>Take Profit Executed!</b>
 
 <b>Sold:</b> {pos['amount']} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
-Profit locked! 🎉""")
+<b>Daily P&L:</b> ${self.daily_pnl:.2f} 🎉{reentry_msg}""")
                             else:
                                 send_telegram(f"""<b>Take Profit FAILED!</b>
 
@@ -2909,8 +3027,68 @@ Use /sell {pos['amount']} {token.lower()}""")
 • RSI: {technicals.get('rsi', 50):.1f}
 • Trend: {technicals.get('trend', 'N/A')}"""
 
-                # Auto mode: propose trade for confirmation
-                if self.auto_mode and self.auto_trades_today < AUTO_MAX_DAILY_TRADES:
+                # Check if we can trade
+                can_trade = (
+                    self.auto_mode and
+                    self.auto_trades_today < AUTO_MAX_DAILY_TRADES and
+                    self.daily_pnl > -FULL_AUTO_MAX_LOSS_USD
+                )
+
+                # Check cooldown
+                cooldown_ok = True
+                if self.last_trade_time:
+                    mins_since_trade = (datetime.now() - self.last_trade_time).total_seconds() / 60
+                    cooldown_ok = mins_since_trade >= FULL_AUTO_COOLDOWN
+
+                # FULL AUTO MODE - Execute immediately without confirmation
+                if self.full_auto and can_trade and cooldown_ok:
+                    # Don't open if we already have a position in this token
+                    if symbol in POSITIONS and action == "BUY":
+                        print(f"Already have {symbol} position, skipping buy")
+                    else:
+                        send_telegram(f"""🤖 <b>FULL AUTO: {action}</b>
+
+<b>{symbol}</b> @ ${price:,.4f}
+<b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reasoning}
+
+<b>Executing trade automatically...</b>""")
+
+                        if action == "BUY":
+                            result = buy_token(symbol, AUTO_TRADE_AMOUNT)
+                            if result.get("success"):
+                                self.auto_trades_today += 1
+                                self.total_trades += 1
+                                self.last_trade_time = datetime.now()
+
+                                # Position is already tracked by buy_token
+                                pos = POSITIONS.get(symbol, {})
+                                send_telegram(f"""✅ <b>AUTO BUY EXECUTED</b>
+
+<b>Bought:</b> {AUTO_TRADE_AMOUNT} {symbol}
+<b>Entry:</b> ${price:.4f}
+<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
+
+<b>Auto Risk Management:</b>
+🛑 SL: ${pos.get('stop_loss_price', 0):.4f}
+🎯 TP: ${pos.get('take_profit_price', 0):.4f}
+
+Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
+                            else:
+                                send_telegram(f"❌ Auto buy failed: {result.get('error')}")
+
+                        elif action == "SELL" and symbol in POSITIONS:
+                            result = sell_token(symbol, POSITIONS[symbol]["amount"])
+                            if result.get("success"):
+                                self.auto_trades_today += 1
+                                self.last_trade_time = datetime.now()
+                                send_telegram(f"""✅ <b>AUTO SELL EXECUTED</b>
+
+<b>Sold:</b> {symbol}
+<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>""")
+
+                # SEMI-AUTO MODE - Propose and wait for confirmation
+                elif self.auto_mode and can_trade and not self.full_auto:
                     if not self.pending_trade:  # Don't overwrite existing pending trade
                         self.pending_trade = {
                             "action": action,
@@ -2933,8 +3111,17 @@ Use /sell {pos['amount']} {token.lower()}""")
 /cancel - Skip this signal
 
 <i>Expires in 60 seconds</i>""")
+
+                # MANUAL MODE or limits reached - Just show signal
                 else:
-                    # Signal only mode (auto mode off or limit reached)
+                    reason_msg = ""
+                    if not cooldown_ok:
+                        reason_msg = f"\n<i>Cooldown: {FULL_AUTO_COOLDOWN - mins_since_trade:.0f} min remaining</i>"
+                    elif self.auto_trades_today >= AUTO_MAX_DAILY_TRADES:
+                        reason_msg = "\n<i>Daily trade limit reached</i>"
+                    elif self.daily_pnl <= -FULL_AUTO_MAX_LOSS_USD:
+                        reason_msg = "\n<i>⚠️ Daily loss limit reached - auto paused</i>"
+
                     send_telegram(f"""<b>{emoji} {action} SIGNAL</b> - {symbol}
 
 <b>Price:</b> ${price:,.4f}
@@ -2942,7 +3129,7 @@ Use /sell {pos['amount']} {token.lower()}""")
 <b>Reason:</b> {reasoning}
 {tech_display}
 
-<i>Use /buy or /sell to trade manually</i>""")
+<i>Use /buy or /sell to trade manually</i>{reason_msg}""")
 
         except Exception as e:
             print(f"Error in cycle: {e}")
@@ -2957,8 +3144,17 @@ Use /sell {pos['amount']} {token.lower()}""")
                 if datetime.now().date() != self.last_trade_date:
                     self.daily_trades = 0
                     self.auto_trades_today = 0
+                    self.daily_pnl = 0.0
                     self.last_trade_date = datetime.now().date()
                     print("Daily counters reset")
+                    if self.full_auto:
+                        send_telegram(f"""📅 <b>New Trading Day</b>
+
+Daily counters reset.
+Max trades: {AUTO_MAX_DAILY_TRADES}
+Max loss: ${FULL_AUTO_MAX_LOSS_USD}
+
+Full auto trading continues...""")
 
                 # Check Telegram commands
                 cmd = check_telegram_commands()
