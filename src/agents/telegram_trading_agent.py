@@ -2117,6 +2117,8 @@ Send /help for all commands""")
 
     def handle_command(self, cmd: str):
         """Handle Telegram command"""
+        global DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT, TRAILING_STOP_ENABLED
+
         if cmd == "/help" or cmd == "/start":
             auto_status = "ON" if self.auto_mode else "OFF"
             send_telegram(f"""<b>Trading Bot Commands</b>
@@ -2555,7 +2557,6 @@ Entry: ${pos['entry_price']:.4f}""")
                         send_telegram(f"Failed to update stop loss for {token}")
                 else:
                     # Update default
-                    global DEFAULT_STOP_LOSS_PCT
                     DEFAULT_STOP_LOSS_PCT = sl_pct
                     send_telegram(f"""✅ <b>Default Stop Loss Updated</b>
 
@@ -2593,7 +2594,6 @@ Entry: ${pos['entry_price']:.4f}""")
                         send_telegram(f"Failed to update take profit for {token}")
                 else:
                     # Update default
-                    global DEFAULT_TAKE_PROFIT_PCT
                     DEFAULT_TAKE_PROFIT_PCT = tp_pct
                     send_telegram(f"""✅ <b>Default Take Profit Updated</b>
 
@@ -2632,7 +2632,6 @@ Amount: {pos['amount']}
                 send_telegram(f"No open position for {token}.\n\nUse /position to see tracked positions.")
 
         elif cmd == "/trailing" or cmd == "/trail":
-            global TRAILING_STOP_ENABLED
             TRAILING_STOP_ENABLED = not TRAILING_STOP_ENABLED
             status = "ON" if TRAILING_STOP_ENABLED else "OFF"
 
