@@ -1736,11 +1736,13 @@ def get_token_balance(wallet_address: str, token_mint: str) -> float:
         print(f"Token balance error: {e}")
         return 0
 
-def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: int = None, retry_count: int = 0) -> dict:
+def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: int = None, retry_count: int = 0, rpc_retry_count: int = 0) -> dict:
     """Execute a swap via Jupiter - using direct HTTP calls (no solana SDK needed)
 
     Includes retry logic with increasing slippage for volatile markets.
+    Also retries up to 3 times for RPC/network failures.
     """
+    MAX_RPC_RETRIES = 3  # Maximum retries for RPC/network failures
     if not SOLANA_PRIVATE_KEY:
         return {"success": False, "error": "No private key configured"}
 
@@ -1750,6 +1752,9 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         # Increase slippage by 500 bps (5%) per retry, up to 50%
         current_slippage = min(5000, current_slippage + (retry_count * 500))
         print(f"Retry {retry_count}: Increasing slippage to {current_slippage/100}%")
+
+    if rpc_retry_count > 0:
+        print(f"🔄 RPC retry {rpc_retry_count}/{MAX_RPC_RETRIES}: Retrying transaction with fresh quote...")
 
     try:
         import base64
@@ -1878,7 +1883,14 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
                 continue
 
         if not tx_sig:
-            return {"success": False, "error": "Failed to send transaction to any RPC"}
+            # Retry with fresh quote if we haven't exceeded max RPC retries
+            if rpc_retry_count < MAX_RPC_RETRIES:
+                import time
+                wait_time = 3 * (rpc_retry_count + 1)  # Increasing delay: 3s, 6s, 9s
+                print(f"❌ All RPCs failed. Waiting {wait_time}s before retry {rpc_retry_count + 1}/{MAX_RPC_RETRIES}...")
+                time.sleep(wait_time)
+                return execute_swap(input_mint, output_mint, amount, slippage_bps, retry_count, rpc_retry_count + 1)
+            return {"success": False, "error": "Failed to send transaction to any RPC after 3 retries"}
 
         # Wait for transaction confirmation
         print("Waiting for confirmation...")
