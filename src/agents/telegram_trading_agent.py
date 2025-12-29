@@ -838,22 +838,38 @@ def fetch_helius_whale_transactions(min_sol: float = 100) -> list:
         return None
 
     try:
-        # Use Helius RPC endpoint (free tier compatible)
-        helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+        # URL encode the API key in case it has special characters
+        from urllib.parse import quote
+        encoded_key = quote(HELIUS_API_KEY, safe='')
 
-        # First test with a simple getHealth call to verify API key works
+        # Use Helius RPC endpoint (free tier compatible)
+        helius_rpc = f"https://mainnet.helius-rpc.com/?api-key={encoded_key}"
+
+        # Test with getBalance (requires auth, unlike getHealth)
         test_payload = {
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getHealth"
+            "method": "getBalance",
+            "params": ["11111111111111111111111111111111"]  # System program (always exists)
         }
 
         test_response = requests.post(helius_rpc, json=test_payload, timeout=10)
         if test_response.status_code == 401:
-            print(f"Helius API key invalid or expired. Get a new key at helius.dev")
+            print(f"Helius API key invalid or expired. Key starts with: {HELIUS_API_KEY[:8]}...")
+            print(f"Get a new key at helius.dev")
             return None
         elif test_response.status_code != 200:
             print(f"Helius connection error: {test_response.status_code}")
+            try:
+                print(f"Response: {test_response.text[:200]}")
+            except:
+                pass
+            return None
+
+        # Verify we got a valid response (not an error)
+        test_result = test_response.json()
+        if "error" in test_result:
+            print(f"Helius API error: {test_result.get('error')}")
             return None
 
         # Get recent signatures for a known whale wallet
@@ -871,6 +887,10 @@ def fetch_helius_whale_transactions(min_sol: float = 100) -> list:
 
         if response.status_code != 200:
             print(f"Helius RPC error: {response.status_code}")
+            try:
+                print(f"Response: {response.text[:300]}")
+            except:
+                pass
             return None
 
         data = response.json()
