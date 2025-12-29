@@ -3220,8 +3220,31 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                             else:
                                 send_telegram(f"❌ Auto buy failed: {result.get('error')}")
 
-                        elif action == "SELL" and symbol in POSITIONS:
-                            sell_amount = POSITIONS[symbol]["amount"]
+                        elif action == "SELL":
+                            # Check actual wallet balance instead of just POSITIONS
+                            from solders.keypair import Keypair
+                            keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+                            wallet_addr = str(keypair.pubkey())
+
+                            # Get actual token balance
+                            token_mint = TOKENS.get(symbol)
+                            if symbol == "SOL":
+                                # For SOL, check native balance
+                                wallet = get_wallet_balance()
+                                actual_balance = wallet.get("sol", 0)
+                            else:
+                                actual_balance = get_token_balance(wallet_addr, token_mint)
+
+                            # Use tracked position amount if available, otherwise use actual balance
+                            if symbol in POSITIONS:
+                                sell_amount = POSITIONS[symbol]["amount"]
+                            elif actual_balance > 0.001:  # Have some balance to sell
+                                sell_amount = actual_balance * 0.95  # Sell 95% to leave dust
+                            else:
+                                send_telegram(f"❌ Auto sell skipped: No {symbol} balance to sell (balance: {actual_balance:.6f})")
+                                continue
+
+                            print(f"Selling {sell_amount} {symbol} (tracked: {symbol in POSITIONS}, actual: {actual_balance:.6f})")
                             result = sell_token(symbol, sell_amount)
                             if result.get("success") and result.get("confirmed", False):
                                 self.auto_trades_today += 1
