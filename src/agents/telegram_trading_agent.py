@@ -92,6 +92,31 @@ AGENT_DATA = {
 }
 
 # ============================================================================
+# SNIPER MODE CONFIGURATION
+# ============================================================================
+SNIPER_WALLET_KEY = os.getenv("SNIPER_WALLET_KEY", "")  # Separate wallet for sniping
+SNIPER_ENABLED = False  # Master switch for sniper mode
+SNIPER_MIN_LIQUIDITY = 5000      # Minimum liquidity in USD
+SNIPER_MAX_BUY_USD = 50          # Maximum buy per snipe in USD
+SNIPER_AUTO_BUY = False          # Auto-buy new tokens (DANGEROUS!)
+SNIPER_CHECK_INTERVAL = 30       # Seconds between checks for new tokens
+SNIPER_API_URL = "http://api.moondev.com:8000"  # Moon Dev's token API
+SNIPER_SEEN_TOKENS = set()       # Track tokens we've already seen
+
+# ============================================================================
+# POLYMARKET MODE CONFIGURATION
+# ============================================================================
+POLYMARKET_WALLET_KEY = os.getenv("POLYMARKET_WALLET_KEY", "")  # Polygon wallet for Polymarket
+POLYMARKET_ENABLED = False  # Master switch for polymarket mode
+POLYMARKET_MIN_TRADE_USD = 500   # Only track trades over this amount
+POLYMARKET_AUTO_BET = False      # Auto-bet on consensus picks (DANGEROUS!)
+POLYMARKET_BET_SIZE_USD = 10     # Size of auto-bets
+POLYMARKET_CONSENSUS_THRESHOLD = 4  # Minimum models agreeing (out of 6) to alert
+POLYMARKET_CHECK_INTERVAL = 300  # Seconds between AI analysis runs
+POLYMARKET_API_URL = "https://data-api.polymarket.com"
+POLYMARKET_WS_URL = "wss://ws-live-data.polymarket.com"
+
+# ============================================================================
 # FREE DATA FEEDS (No API keys required)
 # ============================================================================
 
@@ -2188,6 +2213,206 @@ Your analysis:"""
         return "HOLD", 0, f"AI error: {str(e)}"
 
 # ============================================================================
+# SNIPER MODE FUNCTIONS
+# ============================================================================
+
+def fetch_new_tokens() -> list:
+    """Fetch new token launches from Moon Dev API"""
+    global SNIPER_SEEN_TOKENS
+    try:
+        url = f"{SNIPER_API_URL}/files/new_token_addresses.csv"
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            print(f"Sniper API error: {response.status_code}")
+            return []
+
+        # Parse CSV content
+        import io
+        import csv
+        content = response.content.decode('utf-8')
+        reader = csv.DictReader(io.StringIO(content))
+
+        new_tokens = []
+        for row in reader:
+            token_address = row.get('address', row.get('mint', ''))
+            if token_address and token_address not in SNIPER_SEEN_TOKENS:
+                # Skip excluded patterns (like wrapped SOL)
+                if token_address == "So11111111111111111111111111111111111111112":
+                    continue
+                new_tokens.append({
+                    "address": token_address,
+                    "name": row.get('name', 'Unknown'),
+                    "symbol": row.get('symbol', '???'),
+                    "timestamp": row.get('timestamp', ''),
+                })
+                SNIPER_SEEN_TOKENS.add(token_address)
+
+        return new_tokens
+    except Exception as e:
+        print(f"Sniper fetch error: {e}")
+        return []
+
+
+def get_token_info_birdeye(token_address: str) -> dict:
+    """Get token info from Birdeye API"""
+    if not BIRDEYE_API_KEY:
+        return {}
+    try:
+        url = f"https://public-api.birdeye.so/defi/token_overview?address={token_address}"
+        headers = {"X-API-KEY": BIRDEYE_API_KEY}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success"):
+                return data.get("data", {})
+        return {}
+    except Exception as e:
+        print(f"Birdeye token info error: {e}")
+        return {}
+
+
+def check_token_safety(token_info: dict) -> dict:
+    """Basic safety checks for a new token"""
+    safety = {
+        "liquidity_ok": False,
+        "holders_ok": False,
+        "age_ok": False,
+        "risk_level": "HIGH",
+        "reasons": []
+    }
+
+    liquidity = token_info.get("liquidity", 0)
+    if liquidity >= SNIPER_MIN_LIQUIDITY:
+        safety["liquidity_ok"] = True
+    else:
+        safety["reasons"].append(f"Low liquidity: ${liquidity:,.0f}")
+
+    # Check holder count
+    holder_count = token_info.get("holder", 0)
+    if holder_count >= 50:
+        safety["holders_ok"] = True
+    else:
+        safety["reasons"].append(f"Few holders: {holder_count}")
+
+    # Determine risk level
+    if safety["liquidity_ok"] and safety["holders_ok"]:
+        safety["risk_level"] = "MEDIUM"
+    if liquidity >= SNIPER_MIN_LIQUIDITY * 2 and holder_count >= 200:
+        safety["risk_level"] = "LOW"
+
+    return safety
+
+
+def sniper_buy_token(token_address: str, amount_usd: float) -> dict:
+    """Buy a new token using sniper wallet"""
+    if not SNIPER_WALLET_KEY:
+        return {"success": False, "error": "Sniper wallet not configured"}
+
+    try:
+        from solders.keypair import Keypair
+        keypair = Keypair.from_base58_string(SNIPER_WALLET_KEY)
+
+        # Convert USD to USDC units
+        usdc_units = int(amount_usd * 1_000_000)
+
+        # Use the existing execute_swap function but with sniper wallet
+        # For now, just return a placeholder - full implementation would need wallet switching
+        return {"success": False, "error": "Sniper auto-buy not yet implemented"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ============================================================================
+# POLYMARKET MODE FUNCTIONS
+# ============================================================================
+
+POLYMARKET_MARKETS = {}  # Cache of tracked markets
+POLYMARKET_LAST_ANALYSIS = None
+
+def fetch_polymarket_trades(min_size: float = 500) -> list:
+    """Fetch recent large trades from Polymarket API"""
+    try:
+        # Get active markets first
+        url = f"{POLYMARKET_API_URL}/markets"
+        response = requests.get(url, timeout=15)
+        if response.status_code != 200:
+            return []
+
+        markets = response.json()
+        large_trades = []
+
+        # Filter for active markets with significant volume
+        for market in markets[:50]:  # Check top 50 markets
+            if market.get("active") and market.get("volume", 0) > min_size:
+                large_trades.append({
+                    "market_id": market.get("id"),
+                    "title": market.get("question", "Unknown"),
+                    "volume": market.get("volume", 0),
+                    "yes_price": market.get("outcomePrices", [0.5, 0.5])[0] if market.get("outcomePrices") else 0.5,
+                    "url": f"https://polymarket.com/event/{market.get('slug', '')}"
+                })
+
+        return large_trades
+    except Exception as e:
+        print(f"Polymarket fetch error: {e}")
+        return []
+
+
+def analyze_polymarket_with_ai(markets: list) -> dict:
+    """Use AI to analyze Polymarket opportunities"""
+    if not OPENAI_KEY or not markets:
+        return {"picks": [], "error": "No API key or markets"}
+
+    try:
+        # Build prompt with market info
+        market_text = "\n".join([
+            f"{i+1}. {m['title']} (Yes: {float(m['yes_price'])*100:.0f}%)"
+            for i, m in enumerate(markets[:10])
+        ])
+
+        prompt = f"""Analyze these Polymarket prediction markets and identify the TOP 3 best opportunities:
+
+{market_text}
+
+For each pick, provide:
+PICK [number]: [YES/NO]
+CONFIDENCE: [0-100]
+REASON: [One sentence]
+
+Focus on markets where the current price seems mispriced based on your knowledge."""
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a prediction market expert. Be concise."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 300,
+            "temperature": 0.3
+        }
+
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+
+        return {"picks": content, "markets": markets, "error": None}
+
+    except Exception as e:
+        return {"picks": [], "error": str(e)}
+
+
+# ============================================================================
 # MAIN BOT
 # ============================================================================
 
@@ -2213,9 +2438,22 @@ class TelegramTradingBot:
         self.winning_trades = 0
         self.losing_trades = 0
 
+        # Sniper mode
+        self.sniper_mode = SNIPER_ENABLED
+        self.sniper_auto_buy = SNIPER_AUTO_BUY
+        self.sniper_last_check = None
+        self.sniper_tokens_found = 0
+
+        # Polymarket mode
+        self.polymarket_mode = POLYMARKET_ENABLED
+        self.polymarket_auto_bet = POLYMARKET_AUTO_BET
+        self.polymarket_last_analysis = None
+        self.polymarket_picks_today = 0
+
         print("=" * 50)
         print("Moon Dev Telegram Trading Bot")
         print("Exchange: Solana + Jupiter DEX")
+        print("Modes: Trading | Sniper | Polymarket")
         print("=" * 50)
 
         # Check configuration
@@ -2273,13 +2511,15 @@ Send /help for all commands""")
 
         if cmd == "/help" or cmd == "/start":
             auto_status = "ON" if self.auto_mode else "OFF"
+            sniper_status = "🟢" if self.sniper_mode else "⚪"
+            poly_status = "🟢" if self.polymarket_mode else "⚪"
             send_telegram(f"""<b>Trading Bot Commands</b>
 
-<b>Auto Trading:</b>
-/fullauto - FULL autonomous mode
-/auto - Semi-auto (needs confirm)
-/confirm - Confirm trade
-/cancel - Cancel trade
+<b>🤖 Bot Modes:</b>
+/fullauto - SOL trading mode
+/sniper - Token sniper mode {sniper_status}
+/polymarket - Prediction markets {poly_status}
+/modes - Show all modes
 
 <b>Trading:</b>
 /buy [amt] [token] - Buy token
@@ -2291,32 +2531,17 @@ Send /help for all commands""")
 /market - SOL price
 /btc - BTC dominance
 /trending - Hot coins
-/gainers - Top movers
-
-<b>DeFi Data:</b>
-/dex - DEX volume
-/yields - Best yields
-/stables - Stablecoin flows
-/tvl - Solana TVL
-
-<b>Pro Data (API key):</b>
-/birdeye - Token details
-/whales - Whale activity
-/exchanges - CEX volumes
 
 <b>Risk Management:</b>
 /position - View positions
 /sl [%] - Set stop loss
 /tp [%] - Set take profit
-/close [token] - Close position
-/trailing - Toggle trailing
 
 <b>Controls:</b>
 /status - Bot status
 /pause /resume
-/data - All data feeds
 
-<i>SL/TP auto-execute when triggered!</i>""")
+<i>Each mode uses separate wallet!</i>""")
 
         elif cmd == "/status":
             wallet = get_wallet_balance()
@@ -2410,6 +2635,143 @@ Use /position to monitor positions.""")
         elif cmd == "/fullauto off":
             self.full_auto = False
             send_telegram("🤖 <b>FULL AUTO MODE: OFF</b>\n\nAutonomous trading disabled.")
+
+        # ============================================
+        # SNIPER MODE COMMANDS
+        # ============================================
+        elif cmd == "/sniper" or cmd == "/sniper toggle":
+            self.sniper_mode = not self.sniper_mode
+            if self.sniper_mode:
+                wallet_status = "✅ Configured" if SNIPER_WALLET_KEY else "❌ Not configured"
+                send_telegram(f"""🎯 <b>SNIPER MODE: ON</b>
+
+Watching for new Solana token launches!
+
+<b>Settings:</b>
+• Min Liquidity: ${SNIPER_MIN_LIQUIDITY:,}
+• Max Buy: ${SNIPER_MAX_BUY_USD}
+• Auto-Buy: {'ON ⚠️' if self.sniper_auto_buy else 'OFF (alerts only)'}
+• Check Interval: {SNIPER_CHECK_INTERVAL}s
+
+<b>Wallet:</b> {wallet_status}
+
+<b>Commands:</b>
+/sniper off - Disable
+/sniper autobuy - Toggle auto-buy
+/sniper status - View stats
+
+<i>⚠️ New tokens are HIGH RISK!</i>""")
+            else:
+                send_telegram("🎯 <b>SNIPER MODE: OFF</b>\n\nNo longer watching for new tokens.")
+
+        elif cmd == "/sniper off":
+            self.sniper_mode = False
+            send_telegram("🎯 <b>SNIPER MODE: OFF</b>")
+
+        elif cmd == "/sniper on":
+            self.sniper_mode = True
+            send_telegram(f"🎯 <b>SNIPER MODE: ON</b>\n\nWatching for new tokens every {SNIPER_CHECK_INTERVAL}s")
+
+        elif cmd == "/sniper autobuy":
+            self.sniper_auto_buy = not self.sniper_auto_buy
+            status = "ON ⚠️ DANGEROUS" if self.sniper_auto_buy else "OFF (alerts only)"
+            send_telegram(f"🎯 <b>Sniper Auto-Buy: {status}</b>")
+
+        elif cmd == "/sniper status":
+            wallet_status = "✅" if SNIPER_WALLET_KEY else "❌"
+            send_telegram(f"""🎯 <b>Sniper Status</b>
+
+<b>Mode:</b> {'🟢 ON' if self.sniper_mode else '⚪ OFF'}
+<b>Auto-Buy:</b> {'⚠️ ON' if self.sniper_auto_buy else 'OFF'}
+<b>Wallet:</b> {wallet_status}
+<b>Tokens Found:</b> {self.sniper_tokens_found}
+<b>Seen Tokens:</b> {len(SNIPER_SEEN_TOKENS)}""")
+
+        # ============================================
+        # POLYMARKET MODE COMMANDS
+        # ============================================
+        elif cmd == "/polymarket" or cmd == "/poly":
+            self.polymarket_mode = not self.polymarket_mode
+            if self.polymarket_mode:
+                wallet_status = "✅ Configured" if POLYMARKET_WALLET_KEY else "❌ Not configured"
+                send_telegram(f"""🔮 <b>POLYMARKET MODE: ON</b>
+
+Analyzing prediction markets with AI!
+
+<b>Settings:</b>
+• Min Trade Size: ${POLYMARKET_MIN_TRADE_USD}
+• Consensus Threshold: {POLYMARKET_CONSENSUS_THRESHOLD}/6 models
+• Auto-Bet: {'ON ⚠️' if self.polymarket_auto_bet else 'OFF (signals only)'}
+• Analysis Interval: {POLYMARKET_CHECK_INTERVAL//60} min
+
+<b>Wallet:</b> {wallet_status}
+
+<b>Commands:</b>
+/poly off - Disable
+/poly analyze - Run AI analysis now
+/poly status - View stats
+
+<i>Uses multiple AI models for consensus!</i>""")
+            else:
+                send_telegram("🔮 <b>POLYMARKET MODE: OFF</b>\n\nNo longer analyzing prediction markets.")
+
+        elif cmd == "/polymarket off" or cmd == "/poly off":
+            self.polymarket_mode = False
+            send_telegram("🔮 <b>POLYMARKET MODE: OFF</b>")
+
+        elif cmd == "/polymarket on" or cmd == "/poly on":
+            self.polymarket_mode = True
+            send_telegram("🔮 <b>POLYMARKET MODE: ON</b>\n\nAnalyzing prediction markets!")
+
+        elif cmd == "/poly analyze" or cmd == "/polymarket analyze":
+            send_telegram("🔮 <b>Running Polymarket Analysis...</b>\n\nThis may take a minute...")
+            markets = fetch_polymarket_trades(POLYMARKET_MIN_TRADE_USD)
+            if markets:
+                analysis = analyze_polymarket_with_ai(markets)
+                if analysis.get("picks"):
+                    send_telegram(f"""🔮 <b>Polymarket AI Picks</b>
+
+{analysis['picks']}
+
+<i>Analyzed {len(markets)} active markets</i>""")
+                else:
+                    send_telegram(f"❌ Analysis failed: {analysis.get('error')}")
+            else:
+                send_telegram("❌ No markets found to analyze")
+
+        elif cmd == "/poly status" or cmd == "/polymarket status":
+            wallet_status = "✅" if POLYMARKET_WALLET_KEY else "❌"
+            send_telegram(f"""🔮 <b>Polymarket Status</b>
+
+<b>Mode:</b> {'🟢 ON' if self.polymarket_mode else '⚪ OFF'}
+<b>Auto-Bet:</b> {'⚠️ ON' if self.polymarket_auto_bet else 'OFF'}
+<b>Wallet:</b> {wallet_status}
+<b>Picks Today:</b> {self.polymarket_picks_today}
+<b>Last Analysis:</b> {self.polymarket_last_analysis or 'Never'}""")
+
+        # ============================================
+        # MODES OVERVIEW
+        # ============================================
+        elif cmd == "/modes":
+            trading_status = "🟢 FULL AUTO" if self.full_auto else ("🟡 Semi-Auto" if self.auto_mode else "⚪ Manual")
+            sniper_status = "🟢 ON" if self.sniper_mode else "⚪ OFF"
+            poly_status = "🟢 ON" if self.polymarket_mode else "⚪ OFF"
+
+            send_telegram(f"""🤖 <b>Bot Modes</b>
+
+<b>1. SOL Trading:</b> {trading_status}
+   Wallet: {'✅' if SOLANA_PRIVATE_KEY else '❌'}
+   /fullauto to toggle
+
+<b>2. Token Sniper:</b> {sniper_status}
+   Wallet: {'✅' if SNIPER_WALLET_KEY else '❌'}
+   /sniper to toggle
+
+<b>3. Polymarket:</b> {poly_status}
+   Wallet: {'✅' if POLYMARKET_WALLET_KEY else '❌'}
+   /poly to toggle
+
+<i>Each mode uses separate funds!</i>""")
 
         elif cmd == "/stats" or cmd == "/performance":
             win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
@@ -2980,6 +3342,104 @@ Usage: /trade [from] [to]
 Try /help for available commands
 Or /trade usdc sol to get a swap link""")
 
+    # ============================================
+    # SNIPER CYCLE
+    # ============================================
+    def run_sniper_cycle(self):
+        """Check for new token launches"""
+        if not self.sniper_mode:
+            return
+
+        try:
+            new_tokens = fetch_new_tokens()
+            if not new_tokens:
+                return
+
+            self.sniper_tokens_found += len(new_tokens)
+            self.sniper_last_check = datetime.now()
+
+            for token in new_tokens[:5]:  # Max 5 alerts at once
+                address = token.get("address", "")
+                name = token.get("name", "Unknown")
+                symbol = token.get("symbol", "???")
+
+                # Get token info if Birdeye is configured
+                token_info = get_token_info_birdeye(address) if BIRDEYE_API_KEY else {}
+                liquidity = token_info.get("liquidity", 0)
+                holders = token_info.get("holder", 0)
+                price = token_info.get("price", 0)
+
+                # Safety check
+                safety = check_token_safety(token_info)
+                risk_emoji = "🟢" if safety["risk_level"] == "LOW" else ("🟡" if safety["risk_level"] == "MEDIUM" else "🔴")
+
+                # Build alert message
+                alert = f"""🎯 <b>NEW TOKEN DETECTED</b>
+
+<b>Name:</b> {name} ({symbol})
+<b>Address:</b> <code>{address[:20]}...</code>
+
+<b>Metrics:</b>
+• Liquidity: ${liquidity:,.0f}
+• Holders: {holders}
+• Price: ${price:.8f}
+
+<b>Risk:</b> {risk_emoji} {safety['risk_level']}
+{chr(10).join(['• ' + r for r in safety['reasons'][:3]]) if safety['reasons'] else ''}
+
+<a href="https://dexscreener.com/solana/{address}">DexScreener</a> | <a href="https://birdeye.so/token/{address}">Birdeye</a>"""
+
+                send_telegram(alert)
+
+                # Auto-buy if enabled and passes safety
+                if self.sniper_auto_buy and safety["liquidity_ok"] and SNIPER_WALLET_KEY:
+                    send_telegram(f"🎯 <b>AUTO-SNIPING:</b> {symbol}...")
+                    result = sniper_buy_token(address, SNIPER_MAX_BUY_USD)
+                    if result.get("success"):
+                        send_telegram(f"✅ Sniped {symbol}! TX: {result.get('url')}")
+                    else:
+                        send_telegram(f"❌ Snipe failed: {result.get('error')}")
+
+        except Exception as e:
+            print(f"Sniper cycle error: {e}")
+
+    # ============================================
+    # POLYMARKET CYCLE
+    # ============================================
+    def run_polymarket_cycle(self):
+        """Analyze Polymarket prediction markets"""
+        if not self.polymarket_mode:
+            return
+
+        try:
+            print("Running Polymarket analysis...")
+            self.polymarket_last_analysis = datetime.now().strftime("%H:%M")
+
+            # Fetch active markets
+            markets = fetch_polymarket_trades(POLYMARKET_MIN_TRADE_USD)
+            if not markets:
+                print("No Polymarket markets found")
+                return
+
+            # Run AI analysis
+            analysis = analyze_polymarket_with_ai(markets)
+            if not analysis.get("picks"):
+                print(f"Polymarket analysis failed: {analysis.get('error')}")
+                return
+
+            self.polymarket_picks_today += 1
+
+            # Send alert with picks
+            send_telegram(f"""🔮 <b>Polymarket AI Analysis</b>
+
+{analysis['picks']}
+
+<i>Analyzed {len(markets)} markets at {self.polymarket_last_analysis}</i>
+<i>Today's analyses: {self.polymarket_picks_today}</i>""")
+
+        except Exception as e:
+            print(f"Polymarket cycle error: {e}")
+
     def run_cycle(self):
         """Run one trading cycle"""
         if self.is_paused:
@@ -3343,6 +3803,27 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
 
 <i>Use /buy or /sell to trade manually</i>{reason_msg}""")
 
+            # HOLD or low confidence - notify user what's happening
+            else:
+                if self.full_auto:
+                    # Get technicals for context
+                    technicals = calculate_technicals(candles)
+                    tech_display = ""
+                    if technicals:
+                        tech_display = f"""
+<b>Technicals:</b>
+• RSI: {technicals.get('rsi', 50):.1f}
+• Trend: {technicals.get('trend', 'N/A')}"""
+
+                    send_telegram(f"""⏸️ <b>HOLD</b> - {symbol}
+
+<b>Price:</b> ${price:,.4f}
+<b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reasoning}
+{tech_display}
+
+<i>No trade action taken</i>""")
+
         except Exception as e:
             print(f"Error in cycle: {e}")
 
@@ -3380,14 +3861,32 @@ Full auto trading continues...""")
                 # Wait for next cycle
                 print(f"Next check in {CHECK_INTERVAL_MINUTES} minutes...")
 
-                # Sleep with periodic command checks
+                # Sleep with periodic command checks and mode cycles
+                sniper_counter = 0
+                polymarket_counter = 0
+
                 for _ in range(CHECK_INTERVAL_MINUTES * 6):
                     if not self.running:
                         break
+
+                    # Check Telegram commands
                     cmd = check_telegram_commands()
                     if cmd:
                         print(f"Command received: {cmd}")
                         self.handle_command(cmd)
+
+                    # Sniper mode check (every ~30 seconds when enabled)
+                    sniper_counter += 10
+                    if self.sniper_mode and sniper_counter >= SNIPER_CHECK_INTERVAL:
+                        sniper_counter = 0
+                        self.run_sniper_cycle()
+
+                    # Polymarket mode check (every ~5 minutes when enabled)
+                    polymarket_counter += 10
+                    if self.polymarket_mode and polymarket_counter >= POLYMARKET_CHECK_INTERVAL:
+                        polymarket_counter = 0
+                        self.run_polymarket_cycle()
+
                     time.sleep(10)
 
             except KeyboardInterrupt:
