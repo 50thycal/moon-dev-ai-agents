@@ -3221,44 +3221,57 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                                 send_telegram(f"❌ Auto buy failed: {result.get('error')}")
 
                         elif action == "SELL":
-                            # Check actual wallet balance instead of just POSITIONS
-                            from solders.keypair import Keypair
-                            keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
-                            wallet_addr = str(keypair.pubkey())
+                            try:
+                                # Check actual wallet balance instead of just POSITIONS
+                                from solders.keypair import Keypair
+                                keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
+                                wallet_addr = str(keypair.pubkey())
+                                print(f"Sell check for {symbol}, wallet: {wallet_addr[:8]}...")
 
-                            # Get actual token balance
-                            token_mint = TOKENS.get(symbol)
-                            if symbol == "SOL":
-                                # For SOL, check native balance
-                                wallet = get_wallet_balance()
-                                actual_balance = wallet.get("sol", 0)
-                            else:
-                                actual_balance = get_token_balance(wallet_addr, token_mint)
+                                # Get actual token balance
+                                token_mint = TOKENS.get(symbol)
+                                if symbol == "SOL":
+                                    # For SOL, check native balance
+                                    print("Fetching SOL balance...")
+                                    wallet = get_wallet_balance()
+                                    actual_balance = wallet.get("sol", 0)
+                                    print(f"SOL balance: {actual_balance}")
+                                else:
+                                    print(f"Fetching {symbol} token balance...")
+                                    actual_balance = get_token_balance(wallet_addr, token_mint)
+                                    print(f"{symbol} balance: {actual_balance}")
 
-                            # Use tracked position amount if available, otherwise use actual balance
-                            if symbol in POSITIONS:
-                                sell_amount = POSITIONS[symbol]["amount"]
-                            elif actual_balance > 0.001:  # Have some balance to sell
-                                sell_amount = actual_balance * 0.95  # Sell 95% to leave dust
-                            else:
-                                send_telegram(f"❌ Auto sell skipped: No {symbol} balance to sell (balance: {actual_balance:.6f})")
-                                continue
+                                # Use tracked position amount if available, otherwise use actual balance
+                                sell_amount = None
+                                if symbol in POSITIONS:
+                                    sell_amount = POSITIONS[symbol]["amount"]
+                                    print(f"Using tracked position amount: {sell_amount}")
+                                elif actual_balance > 0.001:  # Have some balance to sell
+                                    sell_amount = actual_balance * 0.95  # Sell 95% to leave dust
+                                    print(f"Using 95% of actual balance: {sell_amount}")
 
-                            print(f"Selling {sell_amount} {symbol} (tracked: {symbol in POSITIONS}, actual: {actual_balance:.6f})")
-                            result = sell_token(symbol, sell_amount)
-                            if result.get("success") and result.get("confirmed", False):
-                                self.auto_trades_today += 1
-                                self.last_trade_time = datetime.now()
-                                # Close position tracking
-                                closed_pos = close_position(symbol)
-                                send_telegram(f"""✅ <b>AUTO SELL CONFIRMED</b>
+                                if sell_amount is None or sell_amount <= 0:
+                                    send_telegram(f"❌ Auto sell skipped: No {symbol} balance to sell (balance: {actual_balance:.6f})")
+                                else:
+                                    print(f"Executing sell: {sell_amount} {symbol}")
+                                    result = sell_token(symbol, sell_amount)
+                                    print(f"Sell result: {result}")
+                                    if result.get("success") and result.get("confirmed", False):
+                                        self.auto_trades_today += 1
+                                        self.last_trade_time = datetime.now()
+                                        # Close position tracking
+                                        closed_pos = close_position(symbol)
+                                        send_telegram(f"""✅ <b>AUTO SELL CONFIRMED</b>
 
 <b>Sold:</b> {sell_amount} {symbol}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>""")
-                            elif result.get("success") and not result.get("confirmed", False):
-                                send_telegram(f"⏳ Sell sent but not confirmed. Check: {result.get('url')}")
-                            else:
-                                send_telegram(f"❌ Auto sell failed: {result.get('error')}")
+                                    elif result.get("success") and not result.get("confirmed", False):
+                                        send_telegram(f"⏳ Sell sent but not confirmed. Check: {result.get('url')}")
+                                    else:
+                                        send_telegram(f"❌ Auto sell failed: {result.get('error')}")
+                            except Exception as sell_error:
+                                print(f"SELL ERROR: {sell_error}")
+                                send_telegram(f"❌ Auto sell error: {str(sell_error)[:100]}")
 
                 # SEMI-AUTO MODE - Propose and wait for confirmation
                 elif self.auto_mode and can_trade and not self.full_auto:
