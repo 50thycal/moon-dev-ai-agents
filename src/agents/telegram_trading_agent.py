@@ -2061,14 +2061,22 @@ def analyze_with_ai(symbol: str, candles: list, wallet_balance: dict = None) -> 
         # Get agent context
         agent_context = get_agent_context()
 
-        # Format wallet info
+        # Format wallet info with position guidance
         wallet_info = ""
+        has_sol_position = False
+        has_usdc_to_buy = False
         if wallet_balance:
+            sol_balance = wallet_balance.get('sol', 0)
+            usdc_balance = wallet_balance.get('usdc', 0)
+            has_sol_position = sol_balance > 0.01  # More than dust
+            has_usdc_to_buy = usdc_balance > 1.0   # More than $1 USDC
             wallet_info = f"""
 Current Position:
-- SOL Balance: {wallet_balance.get('sol', 0):.4f} (${wallet_balance.get('sol_usd', 0):.2f})
-- USDC Balance: ${wallet_balance.get('usdc', 0):.2f}
+- SOL Balance: {sol_balance:.4f} (${wallet_balance.get('sol_usd', 0):.2f})
+- USDC Balance: ${usdc_balance:.2f}
 - Total Value: ${wallet_balance.get('total_usd', 0):.2f}
+- Has SOL to sell: {'YES' if has_sol_position else 'NO'}
+- Has USDC to buy: {'YES' if has_usdc_to_buy else 'NO'}
 """
 
         # Format technical analysis
@@ -2110,10 +2118,15 @@ DECISION: [BUY/SELL/HOLD]
 CONFIDENCE: [0-100]
 REASON: [One sentence explanation]
 
-Guidelines:
-- BUY when: RSI < 35 (oversold), bullish trend, positive momentum
-- SELL when: RSI > 70 (overbought), bearish trend, negative momentum
-- HOLD when: Mixed signals, RSI between 40-60, unclear trend
+CRITICAL RULES (MUST FOLLOW):
+- You can ONLY recommend SELL if "Has SOL to sell: YES" - otherwise HOLD
+- You can ONLY recommend BUY if "Has USDC to buy: YES" - otherwise HOLD
+- If you cannot execute the action, you MUST say HOLD
+
+Guidelines for when position allows:
+- BUY when: Has USDC AND (RSI < 35 oversold, bullish trend, positive momentum)
+- SELL when: Has SOL AND (RSI > 70 overbought, bearish trend, negative momentum)
+- HOLD when: No position to trade, mixed signals, RSI between 40-60, unclear trend
 - Confidence should reflect signal strength (70+ for clear signals)
 
 Your analysis:"""
@@ -3152,8 +3165,7 @@ Use /sell {pos['amount']} {token.lower()}""")
 
             # Check for actionable signals
             if confidence >= MIN_CONFIDENCE and action != "HOLD":
-                self.daily_trades += 1
-
+                # Note: daily_trades is only incremented when trades actually execute (not here)
                 emoji = "🟢" if action == "BUY" else "🔴"
 
                 # Calculate technicals for display
@@ -3180,15 +3192,29 @@ Use /sell {pos['amount']} {token.lower()}""")
 
                 # FULL AUTO MODE - Execute immediately without confirmation
                 if self.full_auto and can_trade and cooldown_ok:
-                    # Don't open if we already have a position in this token
-                    if symbol in POSITIONS and action == "BUY":
+                    # Position validation - check if we CAN execute the action
+                    sol_balance = wallet.get('sol', 0)
+                    usdc_balance = wallet.get('usdc', 0)
+
+                    # Skip if trying to BUY without USDC
+                    if action == "BUY" and usdc_balance < 1.0:
+                        print(f"Skipping BUY - insufficient USDC (${usdc_balance:.2f})")
+                        send_telegram(f"⏸️ <b>Signal: BUY</b> but no USDC to buy with (${usdc_balance:.2f})")
+                    # Skip if trying to SELL without SOL
+                    elif action == "SELL" and sol_balance < 0.01:
+                        print(f"Skipping SELL - insufficient SOL ({sol_balance:.4f})")
+                        send_telegram(f"⏸️ <b>Signal: SELL</b> but no SOL position to sell ({sol_balance:.4f} SOL)")
+                    # Skip if already have position and trying to BUY more
+                    elif symbol in POSITIONS and action == "BUY":
                         print(f"Already have {symbol} position, skipping buy")
                     else:
+                        # We have a valid position for this action - proceed
                         send_telegram(f"""🤖 <b>FULL AUTO: {action}</b>
 
 <b>{symbol}</b> @ ${price:,.4f}
 <b>Confidence:</b> {confidence}%
 <b>Reason:</b> {reasoning}
+<b>Trades today:</b> {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}
 
 <b>Executing trade automatically...</b>""")
 
