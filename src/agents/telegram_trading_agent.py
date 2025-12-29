@@ -1716,42 +1716,50 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         print(f"Executing swap: {input_mint[:8]}... -> {output_mint[:8]}...")
         print(f"Amount: {amount}")
 
-        # Get quote from Jupiter with current slippage
-        quote_url = f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={current_slippage}"
+        # Get quote from Jupiter Lite API (more reliable)
+        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={current_slippage}"
         print(f"Getting quote (slippage: {current_slippage/100}%)...")
         quote_response = requests.get(quote_url, timeout=15)
+
+        # Check HTTP status first
+        if quote_response.status_code != 200:
+            print(f"Quote API error: HTTP {quote_response.status_code}")
+            return {"success": False, "error": f"Quote API returned HTTP {quote_response.status_code}"}
+
         quote = quote_response.json()
 
         if "error" in quote:
+            print(f"Quote error response: {quote}")
             return {"success": False, "error": f"Quote error: {quote.get('error')}"}
 
-        # Get expected output
+        # Get expected output and validate
         out_amount = int(quote.get("outAmount", 0))
         print(f"Expected output: {out_amount}")
 
-        # Get swap transaction from Jupiter (using regular API for better reliability)
+        # Validate that we have a valid quote before proceeding
+        if out_amount <= 0:
+            print(f"Invalid quote - outAmount is 0. Full quote response: {quote}")
+            return {"success": False, "error": "Quote returned zero output - no valid route found"}
+
+        # Get swap transaction from Jupiter Lite API
         print("Getting swap transaction...")
         swap_response = requests.post(
-            "https://api.jup.ag/swap/v1/swap",
+            "https://lite-api.jup.ag/swap/v1/swap",
             headers={"Content-Type": "application/json"},
             json={
                 "quoteResponse": quote,
                 "userPublicKey": str(keypair.pubkey()),
                 "wrapUnwrapSOL": True,
-                "dynamicComputeUnitLimit": True,
-                "dynamicSlippage": {
-                    "minBps": 50,      # Minimum 0.5% slippage
-                    "maxBps": 1000     # Maximum 10% slippage (auto-adjusted)
-                },
-                "prioritizationFeeLamports": {
-                    "priorityLevelWithMaxLamports": {
-                        "maxLamports": 5000000,  # Up to 0.005 SOL for priority (higher)
-                        "priorityLevel": "veryHigh"
-                    }
-                }
+                "prioritizationFeeLamports": 100000  # ~0.0001 SOL priority fee
             },
             timeout=30
         )
+
+        # Check HTTP status
+        if swap_response.status_code != 200:
+            print(f"Swap API error: HTTP {swap_response.status_code}")
+            return {"success": False, "error": f"Swap API returned HTTP {swap_response.status_code}"}
+
         swap_data = swap_response.json()
 
         if "error" in swap_data:
