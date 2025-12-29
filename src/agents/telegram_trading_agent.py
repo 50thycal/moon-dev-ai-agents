@@ -1717,7 +1717,7 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         print(f"Amount: {amount}")
 
         # Get quote from Jupiter with current slippage
-        quote_url = f"https://lite-api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={current_slippage}"
+        quote_url = f"https://api.jup.ag/swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={current_slippage}"
         print(f"Getting quote (slippage: {current_slippage/100}%)...")
         quote_response = requests.get(quote_url, timeout=15)
         quote = quote_response.json()
@@ -1729,21 +1729,24 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         out_amount = int(quote.get("outAmount", 0))
         print(f"Expected output: {out_amount}")
 
-        # Get swap transaction from Jupiter
+        # Get swap transaction from Jupiter (using regular API for better reliability)
         print("Getting swap transaction...")
         swap_response = requests.post(
-            "https://lite-api.jup.ag/swap/v1/swap",
+            "https://api.jup.ag/swap/v1/swap",
             headers={"Content-Type": "application/json"},
             json={
                 "quoteResponse": quote,
                 "userPublicKey": str(keypair.pubkey()),
                 "wrapUnwrapSOL": True,
                 "dynamicComputeUnitLimit": True,
-                "dynamicSlippage": True,  # Let Jupiter handle slippage dynamically
+                "dynamicSlippage": {
+                    "minBps": 50,      # Minimum 0.5% slippage
+                    "maxBps": 1000     # Maximum 10% slippage (auto-adjusted)
+                },
                 "prioritizationFeeLamports": {
                     "priorityLevelWithMaxLamports": {
-                        "maxLamports": 1000000,  # Up to 0.001 SOL for priority
-                        "priorityLevel": "high"
+                        "maxLamports": 5000000,  # Up to 0.005 SOL for priority (higher)
+                        "priorityLevel": "veryHigh"
                     }
                 }
             },
@@ -1767,7 +1770,7 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         signed_tx_bytes = bytes(signed_tx)
         signed_tx_base64 = base64.b64encode(signed_tx_bytes).decode('utf-8')
 
-        # Send transaction using direct HTTP call to Solana RPC (no SDK needed!)
+        # Send transaction using direct HTTP call to Solana RPC
         print("Sending transaction...")
         rpc_payload = {
             "jsonrpc": "2.0",
@@ -1777,59 +1780,100 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
                 signed_tx_base64,
                 {
                     "encoding": "base64",
-                    "skipPreflight": True,  # Skip simulation to avoid stale data errors
-                    "preflightCommitment": "processed",
-                    "maxRetries": 5
+                    "skipPreflight": False,  # Enable preflight to catch errors before sending
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3
                 }
             ]
         }
 
-        # Try primary RPC endpoint first
+        # Try primary RPC endpoint first, then fallback
         rpc_endpoints = [RPC_ENDPOINT, "https://api.mainnet-beta.solana.com"]
-        rpc_result = None
+        tx_sig = None
 
         for rpc_url in rpc_endpoints:
             try:
                 print(f"Trying RPC: {rpc_url[:40]}...")
-                rpc_response = requests.post(rpc_url, json=rpc_payload, timeout=30)
+                rpc_response = requests.post(rpc_url, json=rpc_payload, timeout=60)
                 rpc_result = rpc_response.json()
 
                 if "result" in rpc_result:
                     tx_sig = rpc_result["result"]
                     print(f"Transaction sent: {tx_sig}")
-                    return {
-                        "success": True,
-                        "signature": tx_sig,
-                        "out_amount": out_amount,
-                        "url": f"https://solscan.io/tx/{tx_sig}"
-                    }
+                    break  # Transaction sent, now confirm it
                 elif "error" in rpc_result:
                     error_msg = rpc_result["error"].get("message", str(rpc_result["error"]))
-                    print(f"RPC error from {rpc_url[:30]}: {error_msg[:50]}")
+                    print(f"RPC error: {error_msg[:80]}")
 
                     # Check for slippage error (0x1788 = 6024) - retry with fresh quote
-                    if "0x1788" in error_msg or "6024" in error_msg or "Slippage" in error_msg:
+                    if "0x1788" in error_msg or "6024" in error_msg or "SlippageToleranceExceeded" in error_msg:
                         if retry_count < 2:
-                            print(f"Slippage error detected, getting fresh quote...")
+                            print(f"Slippage error, getting fresh quote...")
                             import time
-                            time.sleep(2)  # Wait for market to settle
+                            time.sleep(2)
                             return execute_swap(input_mint, output_mint, amount, None, retry_count + 1)
                         else:
-                            return {"success": False, "error": f"Slippage error persists after retries. Try a smaller trade amount."}
+                            return {"success": False, "error": f"Slippage error after retries. Market too volatile."}
 
                     # Try next RPC on other errors
                     continue
             except requests.exceptions.Timeout:
-                print(f"RPC timeout on {rpc_url[:30]}, trying next...")
+                print(f"RPC timeout, trying next...")
                 continue
             except Exception as e:
-                print(f"RPC error on {rpc_url[:30]}: {e}")
+                print(f"RPC error: {e}")
                 continue
 
-        # All RPCs failed
-        if rpc_result and "error" in rpc_result:
-            return {"success": False, "error": f"RPC error: {rpc_result['error'].get('message', str(rpc_result['error']))}"}
-        return {"success": False, "error": "All RPC endpoints failed"}
+        if not tx_sig:
+            return {"success": False, "error": "Failed to send transaction to any RPC"}
+
+        # Wait for transaction confirmation
+        print("Waiting for confirmation...")
+        import time
+        confirmed = False
+        for attempt in range(15):  # Wait up to 30 seconds
+            time.sleep(2)
+            try:
+                confirm_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getSignatureStatuses",
+                    "params": [[tx_sig], {"searchTransactionHistory": True}]
+                }
+                confirm_response = requests.post(rpc_endpoints[0], json=confirm_payload, timeout=10)
+                confirm_result = confirm_response.json()
+
+                statuses = confirm_result.get("result", {}).get("value", [])
+                if statuses and statuses[0]:
+                    status = statuses[0]
+                    if status.get("err"):
+                        # Transaction failed on-chain
+                        err = status.get("err")
+                        print(f"Transaction failed on-chain: {err}")
+                        if retry_count < 2:
+                            print("Retrying with fresh quote...")
+                            time.sleep(2)
+                            return execute_swap(input_mint, output_mint, amount, None, retry_count + 1)
+                        return {"success": False, "error": f"Transaction failed: {err}"}
+                    elif status.get("confirmationStatus") in ["confirmed", "finalized"]:
+                        confirmed = True
+                        print(f"Transaction confirmed: {status.get('confirmationStatus')}")
+                        break
+            except Exception as e:
+                print(f"Confirmation check error: {e}")
+                continue
+
+        if not confirmed:
+            # Transaction might still be pending, check one more time
+            print("Transaction not confirmed in time, may still be pending...")
+
+        return {
+            "success": confirmed,
+            "signature": tx_sig,
+            "out_amount": out_amount,
+            "url": f"https://solscan.io/tx/{tx_sig}",
+            "confirmed": confirmed
+        }
 
     except Exception as e:
         error_str = str(e)
@@ -3122,17 +3166,19 @@ Use /sell {pos['amount']} {token.lower()}""")
 
                         if action == "BUY":
                             result = buy_token(symbol, AUTO_TRADE_AMOUNT)
-                            if result.get("success"):
+                            if result.get("success") and result.get("confirmed", False):
                                 self.auto_trades_today += 1
                                 self.total_trades += 1
                                 self.last_trade_time = datetime.now()
 
-                                # Position is already tracked by buy_token
-                                pos = POSITIONS.get(symbol, {})
-                                send_telegram(f"""✅ <b>AUTO BUY EXECUTED</b>
+                                # Track position with SL/TP after confirmed trade
+                                entry_price = get_token_price(symbol)
+                                pos = open_position(symbol, AUTO_TRADE_AMOUNT, entry_price)
+
+                                send_telegram(f"""✅ <b>AUTO BUY CONFIRMED</b>
 
 <b>Bought:</b> {AUTO_TRADE_AMOUNT} {symbol}
-<b>Entry:</b> ${price:.4f}
+<b>Entry:</b> ${entry_price:.4f}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
 <b>Auto Risk Management:</b>
@@ -3140,18 +3186,28 @@ Use /sell {pos['amount']} {token.lower()}""")
 🎯 TP: ${pos.get('take_profit_price', 0):.4f}
 
 Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
+                            elif result.get("success") and not result.get("confirmed", False):
+                                # Transaction sent but not confirmed - don't track position
+                                send_telegram(f"⏳ Trade sent but not confirmed. Check: {result.get('url')}")
                             else:
                                 send_telegram(f"❌ Auto buy failed: {result.get('error')}")
 
                         elif action == "SELL" and symbol in POSITIONS:
-                            result = sell_token(symbol, POSITIONS[symbol]["amount"])
-                            if result.get("success"):
+                            sell_amount = POSITIONS[symbol]["amount"]
+                            result = sell_token(symbol, sell_amount)
+                            if result.get("success") and result.get("confirmed", False):
                                 self.auto_trades_today += 1
                                 self.last_trade_time = datetime.now()
-                                send_telegram(f"""✅ <b>AUTO SELL EXECUTED</b>
+                                # Close position tracking
+                                closed_pos = close_position(symbol)
+                                send_telegram(f"""✅ <b>AUTO SELL CONFIRMED</b>
 
-<b>Sold:</b> {symbol}
+<b>Sold:</b> {sell_amount} {symbol}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>""")
+                            elif result.get("success") and not result.get("confirmed", False):
+                                send_telegram(f"⏳ Sell sent but not confirmed. Check: {result.get('url')}")
+                            else:
+                                send_telegram(f"❌ Auto sell failed: {result.get('error')}")
 
                 # SEMI-AUTO MODE - Propose and wait for confirmation
                 elif self.auto_mode and can_trade and not self.full_auto:
