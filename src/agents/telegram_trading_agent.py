@@ -3803,6 +3803,27 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
 
 <i>Use /buy or /sell to trade manually</i>{reason_msg}""")
 
+            # HOLD or low confidence - notify user what's happening
+            else:
+                if self.full_auto:
+                    # Get technicals for context
+                    technicals = calculate_technicals(candles)
+                    tech_display = ""
+                    if technicals:
+                        tech_display = f"""
+<b>Technicals:</b>
+• RSI: {technicals.get('rsi', 50):.1f}
+• Trend: {technicals.get('trend', 'N/A')}"""
+
+                    send_telegram(f"""⏸️ <b>HOLD</b> - {symbol}
+
+<b>Price:</b> ${price:,.4f}
+<b>Confidence:</b> {confidence}%
+<b>Reason:</b> {reasoning}
+{tech_display}
+
+<i>No trade action taken</i>""")
+
         except Exception as e:
             print(f"Error in cycle: {e}")
 
