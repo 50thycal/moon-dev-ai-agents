@@ -2462,6 +2462,9 @@ class TelegramTradingBot:
         self.polymarket_last_analysis = None
         self.polymarket_picks_today = 0
 
+        # Trade history for /lastten command (keeps last 10 trades)
+        self.recent_trades = []  # List of {"action", "token", "amount", "price", "pnl_pct", "pnl_usd", "timestamp", "type"}
+
         print("=" * 50)
         print("Moon Dev Telegram Trading Bot")
         print("Exchange: Solana + Jupiter DEX")
@@ -2517,6 +2520,24 @@ USDC: ${wallet.get('usdc', 0):.2f}
 Send /fullauto for hands-free trading
 Send /help for all commands""")
 
+    def record_trade(self, action: str, token: str, amount: float, price: float,
+                     pnl_pct: float = 0.0, pnl_usd: float = 0.0, trade_type: str = "manual"):
+        """Record a trade to the recent_trades history for /lastten command"""
+        trade = {
+            "action": action,  # BUY, SELL
+            "token": token,
+            "amount": amount,
+            "price": price,
+            "pnl_pct": pnl_pct,
+            "pnl_usd": pnl_usd,
+            "type": trade_type,  # manual, auto, stop_loss, take_profit
+            "timestamp": datetime.now()
+        }
+        self.recent_trades.append(trade)
+        # Keep only last 10 trades
+        if len(self.recent_trades) > 10:
+            self.recent_trades = self.recent_trades[-10:]
+
     def handle_command(self, cmd: str):
         """Handle Telegram command"""
         global DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT, TRAILING_STOP_ENABLED
@@ -2551,6 +2572,8 @@ Send /help for all commands""")
 
 <b>Controls:</b>
 /status - Bot status
+/stats - Trading statistics
+/lastten - Last 10 trades + PnL
 /pause /resume
 
 <i>Each mode uses separate wallet!</i>""")
@@ -2801,6 +2824,44 @@ Analyzing prediction markets with AI!
 <b>Mode:</b> {'🤖 FULL AUTO' if self.full_auto else ('⚡ Semi-Auto' if self.auto_mode else '👤 Manual')}
 <b>Status:</b> {'⏸ PAUSED' if self.is_paused else '▶️ RUNNING'}""")
 
+        elif cmd == "/lastten" or cmd == "/last10" or cmd == "/recent":
+            if not self.recent_trades:
+                send_telegram("""📋 <b>Last 10 Trades</b>
+
+No trades recorded yet this session.
+
+Start trading to see your history here!""")
+            else:
+                trades_msg = ""
+                total_pnl = 0.0
+                for i, trade in enumerate(reversed(self.recent_trades), 1):
+                    action_emoji = "🟢" if trade["action"] == "BUY" else "🔴"
+                    pnl_emoji = ""
+                    pnl_str = ""
+                    if trade["action"] == "SELL" and trade["pnl_pct"] != 0:
+                        pnl_emoji = "📈" if trade["pnl_pct"] >= 0 else "📉"
+                        pnl_str = f" | {pnl_emoji} {trade['pnl_pct']:+.2f}% (${trade['pnl_usd']:+.2f})"
+                        total_pnl += trade["pnl_usd"]
+
+                    # Format timestamp
+                    time_str = trade["timestamp"].strftime("%m/%d %H:%M")
+                    type_label = trade["type"].upper()
+
+                    trades_msg += f"{i}. {action_emoji} <b>{trade['action']}</b> {trade['amount']:.4f} {trade['token']} @ ${trade['price']:.4f}{pnl_str}\n   <i>{type_label} | {time_str}</i>\n\n"
+
+                # Summary
+                sell_trades = [t for t in self.recent_trades if t["action"] == "SELL"]
+                winning = len([t for t in sell_trades if t["pnl_pct"] > 0])
+                losing = len([t for t in sell_trades if t["pnl_pct"] < 0])
+
+                summary_emoji = "🎉" if total_pnl >= 0 else "😢"
+
+                send_telegram(f"""📋 <b>Last {len(self.recent_trades)} Trades</b>
+
+{trades_msg}<b>Summary:</b>
+{summary_emoji} Total P&L: ${total_pnl:+.2f}
+✅ Winning: {winning} | ❌ Losing: {losing}""")
+
         # Semi-auto trading commands
         elif cmd == "/auto" or cmd == "/auto toggle":
             if self.full_auto:
@@ -2868,6 +2929,8 @@ For hands-free: /fullauto""")
                 if trade['action'] == "BUY":
                     # Track position with SL/TP
                     pos = open_position(trade['token'], trade['amount'], current_price)
+                    # Record trade for /lastten
+                    self.record_trade("BUY", trade['token'], trade['amount'], current_price, trade_type="confirmed")
                     send_telegram(f"""<b>{trade['action']} SUCCESS!</b>
 
 <b>Amount:</b> {trade['amount']} {trade['token']}
@@ -2882,6 +2945,8 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                 else:
                     # Calculate P&L for sells
                     pnl_msg = ""
+                    pnl_pct = 0.0
+                    pnl_usd = 0.0
                     if trade['token'] in POSITIONS:
                         pos = POSITIONS[trade['token']]
                         entry = pos["entry_price"]
@@ -2890,6 +2955,10 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                         pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
                         pnl_msg = f"\n<b>P&L:</b> {pnl_emoji} {pnl_pct:+.2f}% (${pnl_usd:+.2f})"
                         close_position(trade['token'])
+
+                    # Record trade for /lastten
+                    self.record_trade("SELL", trade['token'], trade['amount'], current_price,
+                                     pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="confirmed")
 
                     send_telegram(f"""<b>{trade['action']} SUCCESS!</b>
 
@@ -3207,6 +3276,8 @@ Please wait...""")
                     # Track position with SL/TP
                     entry_price = get_token_price(token)
                     pos = open_position(token, amount, entry_price)
+                    # Record trade for /lastten
+                    self.record_trade("BUY", token, amount, entry_price, trade_type="manual")
 
                     send_telegram(f"""<b>BUY SUCCESS!</b>
 
@@ -3271,6 +3342,8 @@ Please wait...""")
 
                     # Calculate P&L if we had a tracked position
                     pnl_msg = ""
+                    pnl_pct = 0.0
+                    pnl_usd = 0.0
                     if token in POSITIONS:
                         pos = POSITIONS[token]
                         entry = pos["entry_price"]
@@ -3282,6 +3355,10 @@ Please wait...""")
                         # Close position if selling full amount
                         if amount >= pos["amount"]:
                             close_position(token)
+
+                    # Record trade for /lastten
+                    self.record_trade("SELL", token, amount, exit_price,
+                                     pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="manual")
 
                     send_telegram(f"""<b>SELL SUCCESS!</b>
 
@@ -3554,6 +3631,9 @@ SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
                                 self.total_trades += 1
                                 self.losing_trades += 1
                                 self.last_trade_time = datetime.now()
+                                # Record trade for /lastten
+                                self.record_trade("SELL", token, pos['amount'], current_price,
+                                                 pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="stop_loss")
 
                                 reentry_msg = ""
                                 if self.full_auto and FULL_AUTO_REENTRY:
@@ -3592,6 +3672,9 @@ Use /sell {pos['amount']} {token.lower()}""")
                                 self.total_trades += 1
                                 self.winning_trades += 1
                                 self.last_trade_time = datetime.now()
+                                # Record trade for /lastten
+                                self.record_trade("SELL", token, pos['amount'], current_price,
+                                                 pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="take_profit")
 
                                 reentry_msg = ""
                                 if self.full_auto and FULL_AUTO_REENTRY:
@@ -3700,6 +3783,8 @@ Use /sell {pos['amount']} {token.lower()}""")
                                 # Track position with SL/TP after confirmed trade
                                 entry_price = get_token_price(symbol)
                                 pos = open_position(symbol, AUTO_TRADE_AMOUNT, entry_price)
+                                # Record trade for /lastten
+                                self.record_trade("BUY", symbol, AUTO_TRADE_AMOUNT, entry_price, trade_type="auto")
 
                                 send_telegram(f"""✅ <b>AUTO BUY CONFIRMED</b>
 
@@ -3752,13 +3837,22 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                                     send_telegram(f"❌ Auto sell skipped: No {symbol} balance to sell (balance: {actual_balance:.6f})")
                                 else:
                                     print(f"Executing sell: {sell_amount} {symbol}")
+                                    # Get entry price before closing position for PnL calc
+                                    entry_price = POSITIONS.get(symbol, {}).get("entry_price", 0)
                                     result = sell_token(symbol, sell_amount)
                                     print(f"Sell result: {result}")
                                     if result.get("success") and result.get("confirmed", False):
                                         self.auto_trades_today += 1
                                         self.last_trade_time = datetime.now()
+                                        # Calculate PnL
+                                        exit_price = get_token_price(symbol)
+                                        pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+                                        pnl_usd = (exit_price - entry_price) * sell_amount if entry_price > 0 else 0
                                         # Close position tracking
                                         closed_pos = close_position(symbol)
+                                        # Record trade for /lastten
+                                        self.record_trade("SELL", symbol, sell_amount, exit_price,
+                                                         pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="auto")
                                         send_telegram(f"""✅ <b>AUTO SELL CONFIRMED</b>
 
 <b>Sold:</b> {sell_amount} {symbol}
