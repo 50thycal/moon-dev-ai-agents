@@ -1600,6 +1600,114 @@ def set_take_profit(token: str, take_profit_pct: float = None, take_profit_price
 
 
 # ============================================================================
+# DUMP DETECTION - Emergency exit triggers
+# ============================================================================
+
+# Dump detection thresholds
+DUMP_PRICE_DROP_PCT = 5.0       # Exit if price drops 5% in 1 hour
+DUMP_VOLUME_SPIKE_MULTIPLIER = 3.0  # Exit if volume spikes 3x during price drop
+
+def detect_dump(candles: list) -> tuple:
+    """
+    Detect if a dump is occurring that should trigger emergency exit.
+    Returns (is_dump, reason)
+    """
+    if not candles or len(candles) < 2:
+        return False, None
+
+    try:
+        # Get last hour's price change
+        current_close = float(candles[-1].get("close", 0))
+        hour_ago_close = float(candles[0].get("close", 0)) if len(candles) >= 1 else current_close
+
+        # If we have enough candles, look back ~1 hour
+        if len(candles) >= 4:  # ~4 x 15min = 1 hour for 15min candles
+            hour_ago_close = float(candles[-4].get("close", current_close))
+
+        if hour_ago_close <= 0 or current_close <= 0:
+            return False, None
+
+        # Calculate 1-hour price change
+        price_change_pct = ((current_close - hour_ago_close) / hour_ago_close) * 100
+
+        # Check for significant drop
+        if price_change_pct <= -DUMP_PRICE_DROP_PCT:
+            return True, f"Price dropped {price_change_pct:.1f}% in last hour"
+
+        # Check for volume spike during price drop
+        if price_change_pct < -2.0 and len(candles) >= 4:
+            recent_volumes = [float(c.get("volume", 0)) for c in candles[-4:]]
+            older_volumes = [float(c.get("volume", 0)) for c in candles[:-4]] if len(candles) > 4 else []
+
+            if recent_volumes and older_volumes:
+                avg_recent = sum(recent_volumes) / len(recent_volumes)
+                avg_older = sum(older_volumes) / len(older_volumes)
+
+                if avg_older > 0 and avg_recent >= avg_older * DUMP_VOLUME_SPIKE_MULTIPLIER:
+                    return True, f"Volume spike {avg_recent/avg_older:.1f}x with {price_change_pct:.1f}% drop"
+
+        return False, None
+
+    except Exception as e:
+        print(f"Dump detection error: {e}")
+        return False, None
+
+
+def emergency_exit_all_positions(reason: str, bot_instance) -> int:
+    """
+    Emergency exit: sell all positions immediately.
+    Returns number of positions closed.
+    """
+    if not POSITIONS:
+        return 0
+
+    closed_count = 0
+    total_pnl = 0.0
+
+    # Copy list to avoid modification during iteration
+    positions_to_close = POSITIONS.copy()
+
+    for pos in positions_to_close:
+        token = pos["token"]
+        amount = pos["amount"]
+
+        try:
+            current_price = get_token_price(token)
+            pnl_pct = ((current_price - pos["entry_price"]) / pos["entry_price"]) * 100
+            pnl_usd = (current_price - pos["entry_price"]) * amount
+
+            result = sell_token(token, amount)
+            if result.get("success"):
+                close_position_by_id(pos["id"])
+                total_pnl += pnl_usd
+                closed_count += 1
+
+                # Record trade
+                bot_instance.record_trade("SELL", token, amount, current_price,
+                                         pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="emergency")
+                bot_instance.daily_pnl += pnl_usd
+                bot_instance.total_trades += 1
+                if pnl_pct >= 0:
+                    bot_instance.winning_trades += 1
+                else:
+                    bot_instance.losing_trades += 1
+        except Exception as e:
+            print(f"Error closing position #{pos['id']}: {e}")
+
+    if closed_count > 0:
+        send_telegram(f"""🚨 <b>EMERGENCY EXIT TRIGGERED</b>
+
+<b>Reason:</b> {reason}
+
+<b>Closed {closed_count} positions</b>
+<b>Total P&L:</b> ${total_pnl:+.2f}
+
+Bot will resume opening positions when conditions stabilize.""")
+
+    return closed_count
+
+
+# ============================================================================
 # TELEGRAM FUNCTIONS
 # ============================================================================
 
@@ -3829,232 +3937,80 @@ Use /sell {pos['amount']} {token.lower()}""")
             # Get wallet balance for context
             wallet = get_wallet_balance()
 
-            # Get candles (if Birdeye is configured)
+            # Get candles for dump detection (if Birdeye is configured)
             candles = []
             if BIRDEYE_API_KEY:
-                candles = get_birdeye_candles(token_address, "1H", 50)
+                candles = get_birdeye_candles(token_address, "15m", 20)  # 20 x 15min = 5 hours
 
-            if not candles:
-                # Use simple price-based analysis
-                print("No candle data, using price-only analysis")
-                candles = [{"close": price}]
+            # ============================================
+            # DUMP DETECTION - Emergency exit all positions
+            # ============================================
+            if candles and POSITIONS:
+                is_dump, dump_reason = detect_dump(candles)
+                if is_dump:
+                    print(f"⚠️ DUMP DETECTED: {dump_reason}")
+                    emergency_exit_all_positions(dump_reason, self)
 
-            # Get AI analysis with enhanced context
-            action, confidence, reasoning = analyze_with_ai(symbol, candles, wallet)
-            print(f"AI Decision: {action} ({confidence}%) - {reasoning}")
+            # ============================================
+            # CONTINUOUS POSITION OPENING LOGIC
+            # ============================================
+            # Check if we can open a new position
+            can_trade = (
+                self.full_auto and
+                self.auto_trades_today < AUTO_MAX_DAILY_TRADES and
+                self.daily_pnl > -FULL_AUTO_MAX_LOSS_USD
+            )
 
-            # Check for actionable signals
-            if confidence >= MIN_CONFIDENCE and action != "HOLD":
-                # Note: daily_trades is only incremented when trades actually execute (not here)
-                emoji = "🟢" if action == "BUY" else "🔴"
+            # Check cooldown
+            cooldown_ok = True
+            if self.last_trade_time:
+                mins_since_trade = (datetime.now() - self.last_trade_time).total_seconds() / 60
+                cooldown_ok = mins_since_trade >= FULL_AUTO_COOLDOWN
 
-                # Calculate technicals for display
-                technicals = calculate_technicals(candles)
-                tech_display = ""
-                if technicals:
-                    tech_display = f"""
-<b>Technicals:</b>
-• RSI: {technicals.get('rsi', 50):.1f}
-• Trend: {technicals.get('trend', 'N/A')}"""
+            if can_trade and cooldown_ok:
+                usdc_balance = wallet.get('usdc', 0)
 
-                # Check if we can trade
-                can_trade = (
-                    self.auto_mode and
-                    self.auto_trades_today < AUTO_MAX_DAILY_TRADES and
-                    self.daily_pnl > -FULL_AUTO_MAX_LOSS_USD
-                )
+                # Check if we can open a new position
+                can_open, reason = can_open_new_position(symbol, price)
 
-                # Check cooldown
-                cooldown_ok = True
-                if self.last_trade_time:
-                    mins_since_trade = (datetime.now() - self.last_trade_time).total_seconds() / 60
-                    cooldown_ok = mins_since_trade >= FULL_AUTO_COOLDOWN
+                if can_open and usdc_balance >= AUTO_TRADE_AMOUNT * price:
+                    # Open new position
+                    print(f"Opening new position: {AUTO_TRADE_AMOUNT} {symbol} @ ${price:.4f}")
 
-                # FULL AUTO MODE - Execute immediately without confirmation
-                if self.full_auto and can_trade and cooldown_ok:
-                    # Position validation - check if we CAN execute the action
-                    sol_balance = wallet.get('sol', 0)
-                    usdc_balance = wallet.get('usdc', 0)
+                    result = buy_token(symbol, AUTO_TRADE_AMOUNT)
+                    if result.get("success") and result.get("confirmed", False):
+                        self.auto_trades_today += 1
+                        self.total_trades += 1
+                        self.last_trade_time = datetime.now()
 
-                    # Skip if trying to BUY without USDC
-                    if action == "BUY" and usdc_balance < 1.0:
-                        print(f"Skipping BUY - insufficient USDC (${usdc_balance:.2f})")
-                        send_telegram(f"⏸️ <b>Signal: BUY</b> but no USDC to buy with (${usdc_balance:.2f})")
-                    # Skip if trying to SELL without SOL
-                    elif action == "SELL" and sol_balance < 0.01:
-                        print(f"Skipping SELL - insufficient SOL ({sol_balance:.4f})")
-                        send_telegram(f"⏸️ <b>Signal: SELL</b> but no SOL position to sell ({sol_balance:.4f} SOL)")
-                    # Skip if at max positions and trying to BUY more
-                    elif get_position_count() >= MAX_POSITIONS and action == "BUY":
-                        print(f"Max positions ({MAX_POSITIONS}) reached, skipping buy")
+                        # Track position with SL/TP
+                        entry_price = get_token_price(symbol)
+                        pos = open_position(symbol, AUTO_TRADE_AMOUNT, entry_price)
+
+                        # Record trade for /lastten
+                        self.record_trade("BUY", symbol, AUTO_TRADE_AMOUNT, entry_price, trade_type="auto")
+
+                        send_telegram(f"""🤖 <b>NEW POSITION OPENED</b>
+
+<b>#{pos['id']} {symbol}</b> @ ${entry_price:.4f}
+<b>Amount:</b> {AUTO_TRADE_AMOUNT}
+
+<b>Risk Management:</b>
+🛑 SL: ${pos['stop_loss_price']:.4f} (-{DEFAULT_STOP_LOSS_PCT}%)
+🎯 TP: ${pos['take_profit_price']:.4f} (+{DEFAULT_TAKE_PROFIT_PCT}%)
+
+<b>Positions:</b> {get_position_count()}/{MAX_POSITIONS}
+<b>Trades today:</b> {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
+
+                    elif result.get("success") and not result.get("confirmed", False):
+                        send_telegram(f"⏳ Trade sent but not confirmed. Check: {result.get('url')}")
                     else:
-                        # We have a valid position for this action - proceed
-                        send_telegram(f"""🤖 <b>FULL AUTO: {action}</b>
+                        print(f"Buy failed: {result.get('error')}")
 
-<b>{symbol}</b> @ ${price:,.4f}
-<b>Confidence:</b> {confidence}%
-<b>Reason:</b> {reasoning}
-<b>Trades today:</b> {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}
-
-<b>Executing trade automatically...</b>""")
-
-                        if action == "BUY":
-                            result = buy_token(symbol, AUTO_TRADE_AMOUNT)
-                            if result.get("success") and result.get("confirmed", False):
-                                self.auto_trades_today += 1
-                                self.total_trades += 1
-                                self.last_trade_time = datetime.now()
-
-                                # Track position with SL/TP after confirmed trade
-                                entry_price = get_token_price(symbol)
-                                pos = open_position(symbol, AUTO_TRADE_AMOUNT, entry_price)
-                                # Record trade for /lastten
-                                self.record_trade("BUY", symbol, AUTO_TRADE_AMOUNT, entry_price, trade_type="auto")
-
-                                send_telegram(f"""✅ <b>AUTO BUY CONFIRMED</b>
-
-<b>Bought:</b> {AUTO_TRADE_AMOUNT} {symbol}
-<b>Entry:</b> ${entry_price:.4f}
-<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
-
-<b>Auto Risk Management:</b>
-🛑 SL: ${pos.get('stop_loss_price', 0):.4f}
-🎯 TP: ${pos.get('take_profit_price', 0):.4f}
-
-Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
-                            elif result.get("success") and not result.get("confirmed", False):
-                                # Transaction sent but not confirmed - don't track position
-                                send_telegram(f"⏳ Trade sent but not confirmed. Check: {result.get('url')}")
-                            else:
-                                send_telegram(f"❌ Auto buy failed: {result.get('error')}")
-
-                        elif action == "SELL":
-                            try:
-                                # Check actual wallet balance instead of just POSITIONS
-                                from solders.keypair import Keypair
-                                keypair = Keypair.from_base58_string(SOLANA_PRIVATE_KEY)
-                                wallet_addr = str(keypair.pubkey())
-                                print(f"Sell check for {symbol}, wallet: {wallet_addr[:8]}...")
-
-                                # Get actual token balance
-                                token_mint = TOKENS.get(symbol)
-                                if symbol == "SOL":
-                                    # For SOL, check native balance
-                                    print("Fetching SOL balance...")
-                                    wallet = get_wallet_balance()
-                                    actual_balance = wallet.get("sol", 0)
-                                    print(f"SOL balance: {actual_balance}")
-                                else:
-                                    print(f"Fetching {symbol} token balance...")
-                                    actual_balance = get_token_balance(wallet_addr, token_mint)
-                                    print(f"{symbol} balance: {actual_balance}")
-
-                                # Use tracked position amount if available, otherwise use actual balance
-                                sell_amount = None
-                                symbol_positions = [p for p in POSITIONS if p["token"] == symbol]
-                                if symbol_positions:
-                                    sell_amount = symbol_positions[0]["amount"]  # Sell oldest position
-                                    print(f"Using tracked position amount: {sell_amount}")
-                                elif actual_balance > 0.001:  # Have some balance to sell
-                                    sell_amount = actual_balance * 0.95  # Sell 95% to leave dust
-                                    print(f"Using 95% of actual balance: {sell_amount}")
-
-                                if sell_amount is None or sell_amount <= 0:
-                                    send_telegram(f"❌ Auto sell skipped: No {symbol} balance to sell (balance: {actual_balance:.6f})")
-                                else:
-                                    print(f"Executing sell: {sell_amount} {symbol}")
-                                    # Get entry price before closing position for PnL calc
-                                    entry_price = symbol_positions[0]["entry_price"] if symbol_positions else 0
-                                    result = sell_token(symbol, sell_amount)
-                                    print(f"Sell result: {result}")
-                                    if result.get("success") and result.get("confirmed", False):
-                                        self.auto_trades_today += 1
-                                        self.last_trade_time = datetime.now()
-                                        # Calculate PnL
-                                        exit_price = get_token_price(symbol)
-                                        pnl_pct = ((exit_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-                                        pnl_usd = (exit_price - entry_price) * sell_amount if entry_price > 0 else 0
-                                        # Close position tracking
-                                        closed_pos = close_position(symbol)
-                                        # Record trade for /lastten
-                                        self.record_trade("SELL", symbol, sell_amount, exit_price,
-                                                         pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="auto")
-                                        send_telegram(f"""✅ <b>AUTO SELL CONFIRMED</b>
-
-<b>Sold:</b> {sell_amount} {symbol}
-<b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>""")
-                                    elif result.get("success") and not result.get("confirmed", False):
-                                        send_telegram(f"⏳ Sell sent but not confirmed. Check: {result.get('url')}")
-                                    else:
-                                        send_telegram(f"❌ Auto sell failed: {result.get('error')}")
-                            except Exception as sell_error:
-                                print(f"SELL ERROR: {sell_error}")
-                                send_telegram(f"❌ Auto sell error: {str(sell_error)[:100]}")
-
-                # SEMI-AUTO MODE - Propose and wait for confirmation
-                elif self.auto_mode and can_trade and not self.full_auto:
-                    if not self.pending_trade:  # Don't overwrite existing pending trade
-                        self.pending_trade = {
-                            "action": action,
-                            "amount": AUTO_TRADE_AMOUNT,
-                            "token": symbol,
-                            "expires": datetime.now() + timedelta(seconds=AUTO_CONFIRM_TIMEOUT)
-                        }
-
-                        send_telegram(f"""<b>{emoji} {action} SIGNAL</b> - {symbol}
-
-<b>Price:</b> ${price:,.4f}
-<b>Confidence:</b> {confidence}%
-<b>Reason:</b> {reasoning}
-{tech_display}
-
-<b>Proposed Trade:</b>
-{action} {AUTO_TRADE_AMOUNT} {symbol}
-
-/confirm - Execute trade
-/cancel - Skip this signal
-
-<i>Expires in 60 seconds</i>""")
-
-                # MANUAL MODE or limits reached - Just show signal
-                else:
-                    reason_msg = ""
-                    if not cooldown_ok:
-                        reason_msg = f"\n<i>Cooldown: {FULL_AUTO_COOLDOWN - mins_since_trade:.0f} min remaining</i>"
-                    elif self.auto_trades_today >= AUTO_MAX_DAILY_TRADES:
-                        reason_msg = "\n<i>Daily trade limit reached</i>"
-                    elif self.daily_pnl <= -FULL_AUTO_MAX_LOSS_USD:
-                        reason_msg = "\n<i>⚠️ Daily loss limit reached - auto paused</i>"
-
-                    send_telegram(f"""<b>{emoji} {action} SIGNAL</b> - {symbol}
-
-<b>Price:</b> ${price:,.4f}
-<b>Confidence:</b> {confidence}%
-<b>Reason:</b> {reasoning}
-{tech_display}
-
-<i>Use /buy or /sell to trade manually</i>{reason_msg}""")
-
-            # HOLD or low confidence - notify user what's happening
-            else:
-                if self.full_auto:
-                    # Get technicals for context
-                    technicals = calculate_technicals(candles)
-                    tech_display = ""
-                    if technicals:
-                        tech_display = f"""
-<b>Technicals:</b>
-• RSI: {technicals.get('rsi', 50):.1f}
-• Trend: {technicals.get('trend', 'N/A')}"""
-
-                    send_telegram(f"""⏸️ <b>HOLD</b> - {symbol}
-
-<b>Price:</b> ${price:,.4f}
-<b>Confidence:</b> {confidence}%
-<b>Reason:</b> {reasoning}
-{tech_display}
-
-<i>No trade action taken</i>""")
+                elif not can_open:
+                    print(f"Cannot open position: {reason}")
+                elif usdc_balance < AUTO_TRADE_AMOUNT * price:
+                    print(f"Insufficient USDC (${usdc_balance:.2f}) for {AUTO_TRADE_AMOUNT} {symbol}")
 
         except Exception as e:
             print(f"Error in cycle: {e}")
