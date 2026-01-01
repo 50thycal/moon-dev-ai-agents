@@ -71,13 +71,19 @@ FULL_AUTO_MAX_LOSS_USD = 50  # Max daily loss before pausing (safety limit)
 FULL_AUTO_COOLDOWN = 5      # Minutes to wait between trades
 
 # Risk Management Settings
-DEFAULT_STOP_LOSS_PCT = 5.0      # Default stop loss percentage (5%)
-DEFAULT_TAKE_PROFIT_PCT = 10.0  # Default take profit percentage (10%)
+DEFAULT_STOP_LOSS_PCT = 3.0      # Default stop loss percentage (3%)
+DEFAULT_TAKE_PROFIT_PCT = 5.0   # Default take profit percentage (5%)
 TRAILING_STOP_ENABLED = False    # Enable trailing stop loss
 TRAILING_STOP_PCT = 3.0         # Trailing stop percentage from high
 
+# Multi-Position Settings
+MAX_POSITIONS = 5               # Maximum number of concurrent positions
+MIN_PRICE_CHANGE_PCT = 0.5      # Minimum price change from last entry to open new position
+
 # Position Tracking (persisted in memory, reset on restart)
-POSITIONS = {}  # {"token": {"entry_price": x, "amount": y, "stop_loss": z, "take_profit": w, "high": h}}
+# Now supports multiple positions as a list with unique IDs
+POSITIONS = []  # [{"id": 1, "token": "SOL", "entry_price": x, "amount": y, ...}, ...]
+NEXT_POSITION_ID = 1  # Auto-incrementing position ID
 
 # External Agent Data (will be populated by agent feeds)
 AGENT_DATA = {
@@ -1300,13 +1306,42 @@ def get_whale_status() -> str:
 
 
 # ============================================================================
-# POSITION & RISK MANAGEMENT
+# POSITION & RISK MANAGEMENT (Multi-Position Support)
 # ============================================================================
+
+def get_position_count() -> int:
+    """Get the number of open positions"""
+    return len(POSITIONS)
+
+
+def get_last_entry_price(token: str) -> float:
+    """Get the most recent entry price for a token, or 0 if no positions"""
+    token = token.upper()
+    token_positions = [p for p in POSITIONS if p["token"] == token]
+    if not token_positions:
+        return 0
+    # Return the most recent entry
+    return max(token_positions, key=lambda p: p["opened_at"])["entry_price"]
+
+
+def can_open_new_position(token: str, current_price: float) -> tuple:
+    """Check if we can open a new position. Returns (can_open, reason)"""
+    if get_position_count() >= MAX_POSITIONS:
+        return False, f"Max positions ({MAX_POSITIONS}) reached"
+
+    last_entry = get_last_entry_price(token)
+    if last_entry > 0:
+        price_change_pct = abs((current_price - last_entry) / last_entry) * 100
+        if price_change_pct < MIN_PRICE_CHANGE_PCT:
+            return False, f"Price only moved {price_change_pct:.2f}% (need {MIN_PRICE_CHANGE_PCT}%)"
+
+    return True, "OK"
+
 
 def open_position(token: str, amount: float, entry_price: float,
                   stop_loss_pct: float = None, take_profit_pct: float = None) -> dict:
-    """Open/add to a tracked position with stop loss and take profit"""
-    global POSITIONS
+    """Open a new tracked position with stop loss and take profit"""
+    global POSITIONS, NEXT_POSITION_ID
 
     sl_pct = stop_loss_pct if stop_loss_pct is not None else DEFAULT_STOP_LOSS_PCT
     tp_pct = take_profit_pct if take_profit_pct is not None else DEFAULT_TAKE_PROFIT_PCT
@@ -1315,6 +1350,7 @@ def open_position(token: str, amount: float, entry_price: float,
     take_profit_price = entry_price * (1 + tp_pct / 100)
 
     position = {
+        "id": NEXT_POSITION_ID,
         "token": token.upper(),
         "amount": amount,
         "entry_price": entry_price,
@@ -1327,64 +1363,139 @@ def open_position(token: str, amount: float, entry_price: float,
         "trailing_stop": TRAILING_STOP_ENABLED
     }
 
-    POSITIONS[token.upper()] = position
-    print(f"Position opened: {amount} {token} @ ${entry_price:.4f} | SL: ${stop_loss_price:.4f} | TP: ${take_profit_price:.4f}")
+    POSITIONS.append(position)
+    NEXT_POSITION_ID += 1
+
+    print(f"Position #{position['id']} opened: {amount} {token} @ ${entry_price:.4f} | SL: ${stop_loss_price:.4f} | TP: ${take_profit_price:.4f}")
+    print(f"Open positions: {get_position_count()}/{MAX_POSITIONS}")
 
     return position
 
 
 def close_position(token: str) -> dict:
-    """Close/remove a tracked position"""
+    """Close the oldest position for a token (for backwards compatibility)"""
+    global POSITIONS
+    token = token.upper()
+
+    # Find oldest position for this token
+    token_positions = [p for p in POSITIONS if p["token"] == token]
+    if not token_positions:
+        return None
+
+    oldest = min(token_positions, key=lambda p: p["opened_at"])
+    POSITIONS.remove(oldest)
+    print(f"Position #{oldest['id']} closed: {token}")
+    return oldest
+
+
+def close_position_by_id(position_id: int) -> dict:
+    """Close a specific position by ID"""
     global POSITIONS
 
-    token = token.upper()
-    if token in POSITIONS:
-        position = POSITIONS.pop(token)
-        print(f"Position closed: {token}")
-        return position
+    for pos in POSITIONS:
+        if pos["id"] == position_id:
+            POSITIONS.remove(pos)
+            print(f"Position #{position_id} closed: {pos['token']}")
+            return pos
     return None
 
 
-def update_position_high(token: str, current_price: float):
-    """Update the high price for trailing stop"""
+def close_all_positions(token: str = None) -> list:
+    """Close all positions (optionally filtered by token). Returns list of closed positions."""
     global POSITIONS
 
-    token = token.upper()
-    if token in POSITIONS:
-        position = POSITIONS[token]
-        if current_price > position["high_price"]:
-            position["high_price"] = current_price
+    if token:
+        token = token.upper()
+        to_close = [p for p in POSITIONS if p["token"] == token]
+    else:
+        to_close = POSITIONS.copy()
 
-            # Update trailing stop if enabled
-            if position.get("trailing_stop"):
-                new_stop = current_price * (1 - TRAILING_STOP_PCT / 100)
-                if new_stop > position["stop_loss_price"]:
-                    position["stop_loss_price"] = new_stop
-                    print(f"Trailing stop updated for {token}: ${new_stop:.4f}")
+    for pos in to_close:
+        POSITIONS.remove(pos)
+        print(f"Position #{pos['id']} closed: {pos['token']}")
+
+    return to_close
+
+
+def update_position_high(position_id: int, current_price: float):
+    """Update the high price for trailing stop on a specific position"""
+    for pos in POSITIONS:
+        if pos["id"] == position_id:
+            if current_price > pos["high_price"]:
+                pos["high_price"] = current_price
+
+                # Update trailing stop if enabled
+                if pos.get("trailing_stop"):
+                    new_stop = current_price * (1 - TRAILING_STOP_PCT / 100)
+                    if new_stop > pos["stop_loss_price"]:
+                        pos["stop_loss_price"] = new_stop
+                        print(f"Trailing stop updated for position #{position_id}: ${new_stop:.4f}")
+            break
+
+
+def check_all_position_triggers(current_price: float) -> list:
+    """Check all positions for SL/TP triggers. Returns list of triggered positions."""
+    triggered = []
+
+    for pos in POSITIONS:
+        entry = pos["entry_price"]
+        sl_price = pos["stop_loss_price"]
+        tp_price = pos["take_profit_price"]
+
+        pnl_pct = ((current_price - entry) / entry) * 100
+        pnl_usd = (current_price - entry) * pos["amount"]
+
+        result = {
+            "triggered": None,
+            "position_id": pos["id"],
+            "current_price": current_price,
+            "entry_price": entry,
+            "pnl_pct": pnl_pct,
+            "pnl_usd": pnl_usd,
+            "position": pos
+        }
+
+        # Check stop loss
+        if current_price <= sl_price:
+            result["triggered"] = "STOP_LOSS"
+            triggered.append(result)
+        # Check take profit
+        elif current_price >= tp_price:
+            result["triggered"] = "TAKE_PROFIT"
+            triggered.append(result)
+        else:
+            # Update high for trailing stop
+            update_position_high(pos["id"], current_price)
+
+    return triggered
 
 
 def check_position_triggers(token: str, current_price: float) -> dict:
-    """Check if stop loss or take profit has been triggered"""
+    """Check if stop loss or take profit has been triggered (backwards compatible - returns first trigger)"""
     token = token.upper()
 
-    if token not in POSITIONS:
+    # Find positions for this token
+    token_positions = [p for p in POSITIONS if p["token"] == token]
+    if not token_positions:
         return None
 
-    position = POSITIONS[token]
-    entry = position["entry_price"]
-    sl_price = position["stop_loss_price"]
-    tp_price = position["take_profit_price"]
+    # Check the oldest position first
+    pos = min(token_positions, key=lambda p: p["opened_at"])
+    entry = pos["entry_price"]
+    sl_price = pos["stop_loss_price"]
+    tp_price = pos["take_profit_price"]
 
     pnl_pct = ((current_price - entry) / entry) * 100
-    pnl_usd = (current_price - entry) * position["amount"]
+    pnl_usd = (current_price - entry) * pos["amount"]
 
     result = {
         "triggered": None,
+        "position_id": pos["id"],
         "current_price": current_price,
         "entry_price": entry,
         "pnl_pct": pnl_pct,
         "pnl_usd": pnl_usd,
-        "position": position
+        "position": pos
     }
 
     # Check stop loss
@@ -1398,7 +1509,7 @@ def check_position_triggers(token: str, current_price: float) -> dict:
         return result
 
     # Update high for trailing stop
-    update_position_high(token, current_price)
+    update_position_high(pos["id"], current_price)
 
     return result
 
@@ -1413,80 +1524,77 @@ You don't have any tracked positions.
 When you buy with /buy, positions are automatically tracked with:
 • Stop Loss: {sl}%
 • Take Profit: {tp}%
+• Max Positions: {max_pos}
 
-Use /sl or /tp to adjust defaults.""".format(sl=DEFAULT_STOP_LOSS_PCT, tp=DEFAULT_TAKE_PROFIT_PCT)
+Positions open automatically every cycle if conditions are met.""".format(
+            sl=DEFAULT_STOP_LOSS_PCT, tp=DEFAULT_TAKE_PROFIT_PCT, max_pos=MAX_POSITIONS)
 
-    lines = ["📊 <b>Open Positions</b>\n"]
+    lines = [f"📊 <b>Open Positions ({get_position_count()}/{MAX_POSITIONS})</b>\n"]
 
-    tokens_to_show = [token.upper()] if token else POSITIONS.keys()
+    # Filter by token if specified
+    positions_to_show = POSITIONS if not token else [p for p in POSITIONS if p["token"] == token.upper()]
 
-    for tok in tokens_to_show:
-        if tok not in POSITIONS:
-            continue
-
-        pos = POSITIONS[tok]
-        current_price = get_token_price(tok)
+    total_pnl_usd = 0
+    for pos in sorted(positions_to_show, key=lambda p: p["opened_at"]):
+        current_price = get_token_price(pos["token"])
         entry = pos["entry_price"]
         amount = pos["amount"]
 
         pnl_pct = ((current_price - entry) / entry) * 100 if entry > 0 else 0
         pnl_usd = (current_price - entry) * amount
+        total_pnl_usd += pnl_usd
 
         pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
         value_usd = current_price * amount
 
-        lines.append(f"<b>{tok}</b>")
+        lines.append(f"<b>#{pos['id']} {pos['token']}</b>")
         lines.append(f"• Amount: {amount:.4f} (${value_usd:.2f})")
         lines.append(f"• Entry: ${entry:.4f}")
-        lines.append(f"• Current: ${current_price:.4f}")
         lines.append(f"• P&L: {pnl_emoji} {pnl_pct:+.2f}% (${pnl_usd:+.2f})")
-        lines.append(f"• Stop Loss: ${pos['stop_loss_price']:.4f} (-{pos['stop_loss_pct']:.1f}%)")
-        lines.append(f"• Take Profit: ${pos['take_profit_price']:.4f} (+{pos['take_profit_pct']:.1f}%)")
-
-        if pos.get("trailing_stop"):
-            lines.append(f"• Trailing: ON (High: ${pos['high_price']:.4f})")
-
+        lines.append(f"• SL: ${pos['stop_loss_price']:.4f} | TP: ${pos['take_profit_price']:.4f}")
         lines.append("")
+
+    # Summary
+    total_emoji = "🟢" if total_pnl_usd >= 0 else "🔴"
+    lines.append(f"<b>Total P&L:</b> {total_emoji} ${total_pnl_usd:+.2f}")
 
     return "\n".join(lines)
 
 
 def set_stop_loss(token: str, stop_loss_pct: float = None, stop_loss_price: float = None) -> bool:
-    """Set stop loss for an existing position"""
-    global POSITIONS
-
+    """Set stop loss for all positions of a token"""
     token = token.upper()
-    if token not in POSITIONS:
+    token_positions = [p for p in POSITIONS if p["token"] == token]
+
+    if not token_positions:
         return False
 
-    position = POSITIONS[token]
-
-    if stop_loss_price:
-        position["stop_loss_price"] = stop_loss_price
-        position["stop_loss_pct"] = ((position["entry_price"] - stop_loss_price) / position["entry_price"]) * 100
-    elif stop_loss_pct:
-        position["stop_loss_pct"] = stop_loss_pct
-        position["stop_loss_price"] = position["entry_price"] * (1 - stop_loss_pct / 100)
+    for pos in token_positions:
+        if stop_loss_price:
+            pos["stop_loss_price"] = stop_loss_price
+            pos["stop_loss_pct"] = ((pos["entry_price"] - stop_loss_price) / pos["entry_price"]) * 100
+        elif stop_loss_pct:
+            pos["stop_loss_pct"] = stop_loss_pct
+            pos["stop_loss_price"] = pos["entry_price"] * (1 - stop_loss_pct / 100)
 
     return True
 
 
 def set_take_profit(token: str, take_profit_pct: float = None, take_profit_price: float = None) -> bool:
-    """Set take profit for an existing position"""
-    global POSITIONS
-
+    """Set take profit for all positions of a token"""
     token = token.upper()
-    if token not in POSITIONS:
+    token_positions = [p for p in POSITIONS if p["token"] == token]
+
+    if not token_positions:
         return False
 
-    position = POSITIONS[token]
-
-    if take_profit_price:
-        position["take_profit_price"] = take_profit_price
-        position["take_profit_pct"] = ((take_profit_price - position["entry_price"]) / position["entry_price"]) * 100
-    elif take_profit_pct:
-        position["take_profit_pct"] = take_profit_pct
-        position["take_profit_price"] = position["entry_price"] * (1 + take_profit_pct / 100)
+    for pos in token_positions:
+        if take_profit_price:
+            pos["take_profit_price"] = take_profit_price
+            pos["take_profit_pct"] = ((take_profit_price - pos["entry_price"]) / pos["entry_price"]) * 100
+        elif take_profit_pct:
+            pos["take_profit_pct"] = take_profit_pct
+            pos["take_profit_price"] = pos["entry_price"] * (1 + take_profit_pct / 100)
 
     return True
 
@@ -2947,8 +3055,9 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                     pnl_msg = ""
                     pnl_pct = 0.0
                     pnl_usd = 0.0
-                    if trade['token'] in POSITIONS:
-                        pos = POSITIONS[trade['token']]
+                    token_positions = [p for p in POSITIONS if p["token"] == trade['token'].upper()]
+                    if token_positions:
+                        pos = token_positions[0]  # Get oldest position
                         entry = pos["entry_price"]
                         pnl_pct = ((current_price - entry) / entry) * 100
                         pnl_usd = (current_price - entry) * trade['amount']
@@ -3140,14 +3249,15 @@ Reply /cancel to skip"""
                 sl_pct = float(parts[0])
                 token = parts[1].upper() if len(parts) > 1 else self.active_token
 
-                if token in POSITIONS:
+                token_positions = [p for p in POSITIONS if p["token"] == token]
+                if token_positions:
                     if set_stop_loss(token, stop_loss_pct=sl_pct):
-                        pos = POSITIONS[token]
+                        pos = token_positions[0]
                         send_telegram(f"""✅ <b>Stop Loss Updated</b>
 
-<b>{token}</b>
-🛑 Stop Loss: ${pos['stop_loss_price']:.4f} (-{sl_pct:.1f}%)
-Entry: ${pos['entry_price']:.4f}""")
+<b>{token}</b> ({len(token_positions)} positions)
+🛑 Stop Loss: {sl_pct}% from entry
+Updated all {token} positions.""")
                     else:
                         send_telegram(f"Failed to update stop loss for {token}")
                 else:
@@ -3177,14 +3287,14 @@ Current default: {0}%""".format(DEFAULT_STOP_LOSS_PCT))
                 tp_pct = float(parts[0])
                 token = parts[1].upper() if len(parts) > 1 else self.active_token
 
-                if token in POSITIONS:
+                token_positions = [p for p in POSITIONS if p["token"] == token]
+                if token_positions:
                     if set_take_profit(token, take_profit_pct=tp_pct):
-                        pos = POSITIONS[token]
                         send_telegram(f"""✅ <b>Take Profit Updated</b>
 
-<b>{token}</b>
-🎯 Take Profit: ${pos['take_profit_price']:.4f} (+{tp_pct:.1f}%)
-Entry: ${pos['entry_price']:.4f}""")
+<b>{token}</b> ({len(token_positions)} positions)
+🎯 Take Profit: {tp_pct}% from entry
+Updated all {token} positions.""")
                     else:
                         send_telegram(f"Failed to update take profit for {token}")
                 else:
@@ -3213,26 +3323,41 @@ Current default: {0}%""".format(DEFAULT_TAKE_PROFIT_PCT))
             if not token:
                 token = self.active_token
 
-            if token in POSITIONS:
+            token_positions = [p for p in POSITIONS if p["token"] == token]
+            if token_positions:
                 pos = close_position(token)
+                remaining = len([p for p in POSITIONS if p["token"] == token])
                 send_telegram(f"""✅ <b>Position Closed</b>
 
-<b>{token}</b> position tracking removed.
+<b>#{pos['id']} {token}</b> tracking removed.
 
 Entry was: ${pos['entry_price']:.4f}
 Amount: {pos['amount']}
+Remaining {token} positions: {remaining}
 
 <i>Note: This only removes tracking. To sell, use /sell</i>""")
             else:
                 send_telegram(f"No open position for {token}.\n\nUse /position to see tracked positions.")
+
+        elif cmd == "/closeall":
+            # Close all position tracking
+            closed = close_all_positions()
+            if closed:
+                send_telegram(f"""✅ <b>All Positions Closed</b>
+
+Removed tracking for {len(closed)} positions.
+
+<i>Note: This only removes tracking. Actual tokens not sold.</i>""")
+            else:
+                send_telegram("No positions to close.")
 
         elif cmd == "/trailing" or cmd == "/trail":
             TRAILING_STOP_ENABLED = not TRAILING_STOP_ENABLED
             status = "ON" if TRAILING_STOP_ENABLED else "OFF"
 
             # Update existing positions
-            for token in POSITIONS:
-                POSITIONS[token]["trailing_stop"] = TRAILING_STOP_ENABLED
+            for pos in POSITIONS:
+                pos["trailing_stop"] = TRAILING_STOP_ENABLED
 
             send_telegram(f"""🔄 <b>Trailing Stop: {status}</b>
 
@@ -3344,8 +3469,9 @@ Please wait...""")
                     pnl_msg = ""
                     pnl_pct = 0.0
                     pnl_usd = 0.0
-                    if token in POSITIONS:
-                        pos = POSITIONS[token]
+                    token_positions = [p for p in POSITIONS if p["token"] == token]
+                    if token_positions:
+                        pos = token_positions[0]  # Use oldest position
                         entry = pos["entry_price"]
                         pnl_pct = ((exit_price - entry) / entry) * 100
                         pnl_usd = (exit_price - entry) * amount
@@ -3600,94 +3726,93 @@ SOL is {direction} <b>{abs(price_change):.1f}%</b> in 24h!
             # POSITION MONITORING - Check SL/TP triggers
             # ============================================
             if POSITIONS:
-                print(f"Checking {len(POSITIONS)} open position(s)...")
-                for token in list(POSITIONS.keys()):
-                    current_price = get_token_price(token)
-                    trigger = check_position_triggers(token, current_price)
+                print(f"Checking {get_position_count()}/{MAX_POSITIONS} open position(s)...")
+                # Get current price for the active token
+                current_price = get_token_price(self.active_token)
 
-                    if trigger and trigger.get("triggered"):
-                        trigger_type = trigger["triggered"]
-                        pos = trigger["position"]
-                        pnl_pct = trigger["pnl_pct"]
-                        pnl_usd = trigger["pnl_usd"]
-                        pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+                # Check all positions for triggers
+                triggered_positions = check_all_position_triggers(current_price)
 
-                        if trigger_type == "STOP_LOSS":
-                            send_telegram(f"""🛑 <b>STOP LOSS TRIGGERED!</b>
+                for trigger in triggered_positions:
+                    trigger_type = trigger["triggered"]
+                    pos = trigger["position"]
+                    pnl_pct = trigger["pnl_pct"]
+                    pnl_usd = trigger["pnl_usd"]
+                    token = pos["token"]
+                    pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
 
-<b>{token}</b> hit stop loss at ${current_price:.4f}
+                    if trigger_type == "STOP_LOSS":
+                        send_telegram(f"""🛑 <b>STOP LOSS TRIGGERED!</b>
+
+<b>#{pos['id']} {token}</b> hit stop loss at ${current_price:.4f}
 
 <b>Entry:</b> ${pos['entry_price']:.4f}
 <b>P&L:</b> {pnl_emoji} {pnl_pct:.2f}% (${pnl_usd:.2f})
 
 <b>Auto-selling to protect capital...</b>""")
 
-                            # Execute stop loss sell
-                            result = sell_token(token, pos['amount'])
-                            if result.get("success"):
-                                close_position(token)
-                                # Track stats
-                                self.daily_pnl += pnl_usd
-                                self.total_trades += 1
-                                self.losing_trades += 1
-                                self.last_trade_time = datetime.now()
-                                # Record trade for /lastten
-                                self.record_trade("SELL", token, pos['amount'], current_price,
-                                                 pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="stop_loss")
+                        # Execute stop loss sell
+                        result = sell_token(token, pos['amount'])
+                        if result.get("success"):
+                            close_position_by_id(pos['id'])
+                            # Track stats
+                            self.daily_pnl += pnl_usd
+                            self.total_trades += 1
+                            self.losing_trades += 1
+                            self.last_trade_time = datetime.now()
+                            # Record trade for /lastten
+                            self.record_trade("SELL", token, pos['amount'], current_price,
+                                             pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="stop_loss")
 
-                                reentry_msg = ""
-                                if self.full_auto and FULL_AUTO_REENTRY:
-                                    reentry_msg = "\n\n<i>Looking for next opportunity...</i>"
-
-                                send_telegram(f"""<b>Stop Loss Executed!</b>
+                            remaining = get_position_count()
+                            send_telegram(f"""<b>Stop Loss Executed!</b>
 
 <b>Sold:</b> {pos['amount']} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
-<b>Daily P&L:</b> ${self.daily_pnl:.2f}{reentry_msg}""")
-                            else:
-                                send_telegram(f"""<b>Stop Loss FAILED!</b>
+<b>Daily P&L:</b> ${self.daily_pnl:.2f}
+<b>Open Positions:</b> {remaining}/{MAX_POSITIONS}""")
+                        else:
+                            send_telegram(f"""<b>Stop Loss FAILED!</b>
 
 Error: {result.get('error')}
 
 <b>MANUAL ACTION REQUIRED</b>
 Use /sell {pos['amount']} {token.lower()}""")
 
-                        elif trigger_type == "TAKE_PROFIT":
-                            send_telegram(f"""🎯 <b>TAKE PROFIT TRIGGERED!</b>
+                    elif trigger_type == "TAKE_PROFIT":
+                        send_telegram(f"""🎯 <b>TAKE PROFIT TRIGGERED!</b>
 
-<b>{token}</b> hit target at ${current_price:.4f}
+<b>#{pos['id']} {token}</b> hit target at ${current_price:.4f}
 
 <b>Entry:</b> ${pos['entry_price']:.4f}
 <b>P&L:</b> {pnl_emoji} +{pnl_pct:.2f}% (+${pnl_usd:.2f})
 
 <b>Auto-selling to lock in profit...</b>""")
 
-                            # Execute take profit sell
-                            result = sell_token(token, pos['amount'])
-                            if result.get("success"):
-                                close_position(token)
-                                # Track stats
-                                self.daily_pnl += pnl_usd
-                                self.total_trades += 1
-                                self.winning_trades += 1
-                                self.last_trade_time = datetime.now()
-                                # Record trade for /lastten
-                                self.record_trade("SELL", token, pos['amount'], current_price,
-                                                 pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="take_profit")
+                        # Execute take profit sell
+                        result = sell_token(token, pos['amount'])
+                        if result.get("success"):
+                            close_position_by_id(pos['id'])
+                            # Track stats
+                            self.daily_pnl += pnl_usd
+                            self.total_trades += 1
+                            self.winning_trades += 1
+                            self.last_trade_time = datetime.now()
+                            # Record trade for /lastten
+                            self.record_trade("SELL", token, pos['amount'], current_price,
+                                             pnl_pct=pnl_pct, pnl_usd=pnl_usd, trade_type="take_profit")
 
-                                reentry_msg = ""
-                                if self.full_auto and FULL_AUTO_REENTRY:
-                                    reentry_msg = "\n\n<i>Looking for next opportunity...</i>"
-
-                                send_telegram(f"""<b>Take Profit Executed!</b>
+                            remaining = get_position_count()
+                            send_telegram(f"""<b>Take Profit Executed!</b>
 
 <b>Sold:</b> {pos['amount']} {token}
 <b>TX:</b> <a href="{result.get('url')}">View on Solscan</a>
 
-<b>Daily P&L:</b> ${self.daily_pnl:.2f} 🎉{reentry_msg}""")
-                            else:
-                                send_telegram(f"""<b>Take Profit FAILED!</b>
+<b>Daily P&L:</b> ${self.daily_pnl:.2f} 🎉
+<b>Open Positions:</b> {remaining}/{MAX_POSITIONS}""")
+                        else:
+                            send_telegram(f"""<b>Take Profit FAILED!</b>
 
 Error: {result.get('error')}
 
@@ -3759,9 +3884,9 @@ Use /sell {pos['amount']} {token.lower()}""")
                     elif action == "SELL" and sol_balance < 0.01:
                         print(f"Skipping SELL - insufficient SOL ({sol_balance:.4f})")
                         send_telegram(f"⏸️ <b>Signal: SELL</b> but no SOL position to sell ({sol_balance:.4f} SOL)")
-                    # Skip if already have position and trying to BUY more
-                    elif symbol in POSITIONS and action == "BUY":
-                        print(f"Already have {symbol} position, skipping buy")
+                    # Skip if at max positions and trying to BUY more
+                    elif get_position_count() >= MAX_POSITIONS and action == "BUY":
+                        print(f"Max positions ({MAX_POSITIONS}) reached, skipping buy")
                     else:
                         # We have a valid position for this action - proceed
                         send_telegram(f"""🤖 <b>FULL AUTO: {action}</b>
@@ -3826,8 +3951,9 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
 
                                 # Use tracked position amount if available, otherwise use actual balance
                                 sell_amount = None
-                                if symbol in POSITIONS:
-                                    sell_amount = POSITIONS[symbol]["amount"]
+                                symbol_positions = [p for p in POSITIONS if p["token"] == symbol]
+                                if symbol_positions:
+                                    sell_amount = symbol_positions[0]["amount"]  # Sell oldest position
                                     print(f"Using tracked position amount: {sell_amount}")
                                 elif actual_balance > 0.001:  # Have some balance to sell
                                     sell_amount = actual_balance * 0.95  # Sell 95% to leave dust
@@ -3838,7 +3964,7 @@ Trades today: {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}""")
                                 else:
                                     print(f"Executing sell: {sell_amount} {symbol}")
                                     # Get entry price before closing position for PnL calc
-                                    entry_price = POSITIONS.get(symbol, {}).get("entry_price", 0)
+                                    entry_price = symbol_positions[0]["entry_price"] if symbol_positions else 0
                                     result = sell_token(symbol, sell_amount)
                                     print(f"Sell result: {result}")
                                     if result.get("success") and result.get("confirmed", False):
