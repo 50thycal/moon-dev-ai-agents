@@ -55,7 +55,7 @@ TOKENS = {
 }
 DEFAULT_TOKEN = "SOL"
 TRADE_SIZE_USD = 10  # Default trade size in USD
-SLIPPAGE_BPS = 1500  # 15% slippage (higher for volatile markets)
+SLIPPAGE_BPS = 100  # 1% max slippage
 CHECK_INTERVAL_MINUTES = 15
 MIN_CONFIDENCE = 70  # Minimum confidence for auto-trading
 
@@ -1746,12 +1746,12 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
     if not SOLANA_PRIVATE_KEY:
         return {"success": False, "error": "No private key configured"}
 
-    # Use provided slippage or default, increase on retries
+    # Use provided slippage or default (capped at 1%)
     current_slippage = slippage_bps or SLIPPAGE_BPS
+    # Cap slippage at 1% (100 bps) even on retries
+    current_slippage = min(100, current_slippage)
     if retry_count > 0:
-        # Increase slippage by 500 bps (5%) per retry, up to 50%
-        current_slippage = min(5000, current_slippage + (retry_count * 500))
-        print(f"Retry {retry_count}: Increasing slippage to {current_slippage/100}%")
+        print(f"Retry {retry_count}: Using slippage {current_slippage/100}%")
 
     if rpc_retry_count > 0:
         print(f"🔄 RPC retry {rpc_retry_count}/{MAX_RPC_RETRIES}: Retrying transaction with fresh quote...")
