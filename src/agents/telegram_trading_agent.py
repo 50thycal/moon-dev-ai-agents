@@ -2170,14 +2170,20 @@ def execute_swap(input_mint: str, output_mint: str, amount: int, slippage_bps: i
         return {"success": False, "error": error_str}
 
 
-def buy_token(token_symbol: str, token_amount: float) -> dict:
-    """Buy a specific amount of a token using USDC"""
+def buy_token(token_symbol: str, token_amount: float, current_price: float = None) -> dict:
+    """Buy a specific amount of a token using USDC
+
+    Args:
+        token_symbol: The token to buy (e.g., "SOL")
+        token_amount: Amount of tokens to buy
+        current_price: Optional price to use (avoids redundant API calls)
+    """
     token_mint = TOKENS.get(token_symbol.upper())
     if not token_mint:
         return {"success": False, "error": f"Unknown token: {token_symbol}"}
 
-    # Get current price to calculate USDC needed
-    price = get_token_price(token_symbol)
+    # Use provided price or fetch current price
+    price = current_price if current_price and current_price > 0 else get_token_price(token_symbol)
     if price <= 0:
         return {"success": False, "error": "Could not get token price"}
 
@@ -3963,28 +3969,29 @@ Use /sell {pos['amount']} {token.lower()}""")
 
             # Check cooldown
             cooldown_ok = True
+            mins_since_trade = 0
             if self.last_trade_time:
                 mins_since_trade = (datetime.now() - self.last_trade_time).total_seconds() / 60
                 cooldown_ok = mins_since_trade >= FULL_AUTO_COOLDOWN
 
-            if can_trade and cooldown_ok:
-                usdc_balance = wallet.get('usdc', 0)
+            # Get USDC balance and check if can open position (for status reporting)
+            usdc_balance = wallet.get('usdc', 0)
+            can_open, reason = can_open_new_position(symbol, price)
 
-                # Check if we can open a new position
-                can_open, reason = can_open_new_position(symbol, price)
+            if can_trade and cooldown_ok:
 
                 if can_open and usdc_balance >= AUTO_TRADE_AMOUNT * price:
                     # Open new position
                     print(f"Opening new position: {AUTO_TRADE_AMOUNT} {symbol} @ ${price:.4f}")
 
-                    result = buy_token(symbol, AUTO_TRADE_AMOUNT)
+                    result = buy_token(symbol, AUTO_TRADE_AMOUNT, current_price=price)
                     if result.get("success") and result.get("confirmed", False):
                         self.auto_trades_today += 1
                         self.total_trades += 1
                         self.last_trade_time = datetime.now()
 
-                        # Track position with SL/TP
-                        entry_price = get_token_price(symbol)
+                        # Track position with SL/TP - use already-fetched price
+                        entry_price = price
                         pos = open_position(symbol, AUTO_TRADE_AMOUNT, entry_price)
 
                         # Record trade for /lastten
@@ -4011,6 +4018,98 @@ Use /sell {pos['amount']} {token.lower()}""")
                     print(f"Cannot open position: {reason}")
                 elif usdc_balance < AUTO_TRADE_AMOUNT * price:
                     print(f"Insufficient USDC (${usdc_balance:.2f}) for {AUTO_TRADE_AMOUNT} {symbol}")
+
+            # ============================================
+            # TELEGRAM STATUS UPDATE - Post bot's thought process
+            # ============================================
+            if self.full_auto:
+                # Gather current state for status update
+                position_count = get_position_count()
+                sentiment = AGENT_DATA.get("sentiment", {})
+                sentiment_val = sentiment.get("value", 50)
+                sentiment_sig = sentiment.get("signal", "NEUTRAL")
+
+                volume = AGENT_DATA.get("volume", {})
+                volume_sig = volume.get("signal", "NEUTRAL")
+                price_change = volume.get("price_change", 0)
+
+                dominance = AGENT_DATA.get("dominance", {})
+                dom_sig = dominance.get("signal", "NEUTRAL")
+
+                dex_vol = AGENT_DATA.get("dex_volume", {})
+                dex_sig = dex_vol.get("signal", "NEUTRAL")
+
+                # Determine current action/status
+                if position_count >= MAX_POSITIONS:
+                    action = "HOLDING - Max positions reached"
+                    action_emoji = "📊"
+                elif not cooldown_ok:
+                    mins_left = FULL_AUTO_COOLDOWN - mins_since_trade if self.last_trade_time else 0
+                    action = f"COOLDOWN - {mins_left:.0f}m until next trade"
+                    action_emoji = "⏳"
+                elif self.auto_trades_today >= AUTO_MAX_DAILY_TRADES:
+                    action = "HOLDING - Daily trade limit reached"
+                    action_emoji = "🛑"
+                elif self.daily_pnl <= -FULL_AUTO_MAX_LOSS_USD:
+                    action = "HOLDING - Daily loss limit reached"
+                    action_emoji = "🛑"
+                elif can_open and usdc_balance >= AUTO_TRADE_AMOUNT * price:
+                    action = "LOOKING TO BUY"
+                    action_emoji = "👀"
+                elif usdc_balance < AUTO_TRADE_AMOUNT * price:
+                    action = "HOLDING - Insufficient USDC"
+                    action_emoji = "💰"
+                else:
+                    action = f"HOLDING - {reason}" if not can_open else "MONITORING"
+                    action_emoji = "📊"
+
+                # Calculate total P&L from positions
+                total_pnl_pct = 0
+                total_pnl_usd = 0
+                if POSITIONS:
+                    for pos in POSITIONS:
+                        pnl_pct = ((price - pos['entry_price']) / pos['entry_price']) * 100
+                        pnl_usd = (price - pos['entry_price']) * pos['amount']
+                        total_pnl_pct += pnl_pct
+                        total_pnl_usd += pnl_usd
+
+                pnl_emoji = "🟢" if total_pnl_usd >= 0 else "🔴"
+
+                # Signal summary
+                signals = []
+                if sentiment_sig == "BULLISH":
+                    signals.append("🟢 Sentiment")
+                elif sentiment_sig == "BEARISH":
+                    signals.append("🔴 Sentiment")
+                if volume_sig == "BULLISH":
+                    signals.append("🟢 Volume")
+                elif volume_sig == "BEARISH":
+                    signals.append("🔴 Volume")
+                if dom_sig == "BULLISH":
+                    signals.append("🟢 Dominance")
+                elif dom_sig == "BEARISH":
+                    signals.append("🔴 Dominance")
+                if dex_sig == "BULLISH":
+                    signals.append("🟢 DEX Vol")
+                elif dex_sig == "BEARISH":
+                    signals.append("🔴 DEX Vol")
+
+                signal_str = " | ".join(signals) if signals else "All Neutral"
+
+                send_telegram(f"""🤖 <b>AUTO MODE STATUS</b>
+
+{action_emoji} <b>Action:</b> {action}
+
+<b>{symbol}:</b> ${price:,.4f} ({'+' if price_change >= 0 else ''}{price_change:.1f}% 24h)
+<b>Positions:</b> {position_count}/{MAX_POSITIONS}
+<b>Open P&L:</b> {pnl_emoji} {total_pnl_pct:.2f}% (${total_pnl_usd:.2f})
+<b>Daily P&L:</b> ${self.daily_pnl:.2f}
+<b>Trades today:</b> {self.auto_trades_today}/{AUTO_MAX_DAILY_TRADES}
+
+<b>Signals:</b> {signal_str}
+<b>Fear/Greed:</b> {sentiment_val}/100
+
+<i>Next update in {CHECK_INTERVAL_MINUTES}m</i>""")
 
         except Exception as e:
             print(f"Error in cycle: {e}")
